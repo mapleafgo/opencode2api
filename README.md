@@ -1,14 +1,12 @@
 # opencode2api
 
-`opencode2api` 是一个本地 HTTP 代理，把 OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages 风格的请求转发到 OpenCode 上游接口，并提供模型别名、reasoning/thinking 兼容、SOCKS5 代理和一个轻量管理面板。
+`opencode2api` 是一个本地 HTTP 代理，把 OpenAI Chat Completions 风格的请求转发到 OpenCode 上游接口，并提供模型别名、reasoning/thinking 兼容、SOCKS5 代理和一个轻量管理面板。
 
 > 这个项目不是 OpenAI、Anthropic 或 OpenCode 的官方项目。请遵守上游服务条款，并只在你有权限的环境中使用。
 
 ## 功能
 
 - OpenAI 兼容接口：`/v1/chat/completions`、`/v1/models`
-- OpenAI Responses 兼容接口：`/v1/responses`
-- Anthropic Messages 兼容接口：`/v1/messages`
 - 流式 SSE 转换和 token 用量统计
 - 模型别名、reasoning effort 映射、强制禁用 thinking
 - SOCKS5 直连、指定代理和轮询代理
