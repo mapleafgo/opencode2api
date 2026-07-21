@@ -2415,28 +2415,33 @@ func main() {
 	} else {
 		slog.Info("admin panel disabled (no password)")
 	}
-	http.HandleFunc("/v1/chat/completions", loggingMiddleware(chatCompletionsHandler))
-	http.HandleFunc("/v1/models", loggingMiddleware(listModelsHandler))
-	http.HandleFunc("/login", loggingMiddleware(loginHandler))
-	http.HandleFunc("/logout", loggingMiddleware(logoutHandler))
-	http.HandleFunc("/api/config", loggingMiddleware(requireAuth(adminConfigHandler)))
-	http.HandleFunc("/api/stats", loggingMiddleware(requireAuth(adminStatsHandler)))
-	http.HandleFunc("/api/reload", loggingMiddleware(requireAuth(reloadHandler)))
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			requireAuth(adminPageHandler)(w, r)
-			return
-		}
-		http.NotFound(w, r)
-	})
+	registerRoutes(http.DefaultServeMux)
 	addr := ":" + port
 	slog.Info("listening", "addr", addr)
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		slog.Error("server terminated", "error", err)
 		os.Exit(1)
 	}
+}
+
+// registerRoutes 注册对外 HTTP 路由。测试用独立 ServeMux 调用此函数，避免污染 DefaultServeMux。
+func registerRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/v1/chat/completions", loggingMiddleware(chatCompletionsHandler))
+	mux.HandleFunc("/v1/models", loggingMiddleware(listModelsHandler))
+	mux.HandleFunc("/login", loggingMiddleware(loginHandler))
+	mux.HandleFunc("/logout", loggingMiddleware(logoutHandler))
+	mux.HandleFunc("/api/config", loggingMiddleware(requireAuth(adminConfigHandler)))
+	mux.HandleFunc("/api/stats", loggingMiddleware(requireAuth(adminStatsHandler)))
+	mux.HandleFunc("/api/reload", loggingMiddleware(requireAuth(reloadHandler)))
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			requireAuth(adminPageHandler)(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	})
 }

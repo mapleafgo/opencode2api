@@ -6,23 +6,9 @@ import (
 	"testing"
 )
 
-// expectedChatOnlyMux describes the chat-only AI route surface.
-// main() still uses DefaultServeMux; this isolated mux locks the product contract.
-func expectedChatOnlyMux() *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"ok":true}`))
-	})
-	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
-	})
-	return mux
-}
-
 func TestRemovedProtocolRoutesReturn404(t *testing.T) {
-	mux := expectedChatOnlyMux()
+	mux := http.NewServeMux()
+	registerRoutes(mux)
 	for _, path := range []string{"/v1/responses", "/v1/messages"} {
 		req := httptest.NewRequest(http.MethodPost, path, nil)
 		rr := httptest.NewRecorder()
@@ -34,7 +20,8 @@ func TestRemovedProtocolRoutesReturn404(t *testing.T) {
 }
 
 func TestChatProtocolRoutesStillRegistered(t *testing.T) {
-	mux := expectedChatOnlyMux()
+	mux := http.NewServeMux()
+	registerRoutes(mux)
 	cases := []struct {
 		method string
 		path   string
