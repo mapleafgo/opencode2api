@@ -40,17 +40,12 @@
 - `model`
 - `messages`
 - `stream`
-- `temperature`
-- `max_tokens`
-- `top_p`
-- `thinking`
-- `reasoning_effort`
 - `extra_body`
 - `tools`
 - `tool_choice`
 
-`model` 会先经过 `model_alias` 解析。`reasoning_effort` 会按 `reasoning_effort_map` 转换。
+`model` 会先经过 `model_alias` 解析；`messages`、`tools`、`tool_choice` 保持原始 JSON 透传。`custom` 工具是 opencode 上游不支持的形态，出站前会做最小适配：工具声明转成 `function`，强制 `tool_choice` 降级为 `auto`，assistant 历史里的 custom `tool_calls` 转成 `function`；其余字段不改写。
 
 ## 流式响应
 
-`stream: true` 时服务会使用 SSE 返回，并在内部清理空 delta、空 finish reason 和不需要的 reasoning 字段。
+`stream: true` 时服务原样透传上游 SSE，仅解析 `usage` 用于 token 统计，不清除 `reasoning_content`，也不重建消息。

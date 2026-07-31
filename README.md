@@ -7,7 +7,7 @@
 ## 功能
 
 - OpenAI 兼容接口：`/v1/chat/completions`、`/v1/models`
-- 流式 SSE 转换和 token 用量统计
+- 流式 SSE 透传和 token 用量统计
 - 模型别名、reasoning effort 映射、强制禁用 thinking
 - SOCKS5 直连、指定代理和轮询代理
 - Web 管理面板：配置、统计、刷新上游会话

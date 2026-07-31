@@ -688,48 +688,14 @@ var (
 // ======================== 数据模型 ========================
 
 type OpenAIRequest struct {
-	Model           string         `json:"model"`
-	Messages        []Message      `json:"messages"`
-	Stream          bool           `json:"stream"`
-	Temperature     *float64       `json:"temperature,omitempty"`
-	MaxTokens       int            `json:"max_tokens,omitempty"`
-	TopP            *float64       `json:"top_p,omitempty"`
-	Thinking        any            `json:"thinking,omitempty"`
-	ReasoningEffort string         `json:"reasoning_effort,omitempty"`
-	ExtraBody       map[string]any `json:"extra_body,omitempty"`
-	Tools           []Tool         `json:"tools,omitempty"`
-	ToolChoice      any            `json:"tool_choice,omitempty"`
-}
-
-type Message struct {
-	Role             string     `json:"role,omitempty"`
-	Content          any        `json:"content,omitempty"`
-	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID       string     `json:"tool_call_id,omitempty"`
-	Name             string     `json:"name,omitempty"`
-	ReasoningContent *string    `json:"reasoning_content,omitempty"`
-}
-
-type ToolCall struct {
-	ID       string       `json:"id"`
-	Type     string       `json:"type"`
-	Function FunctionCall `json:"function"`
-}
-
-type FunctionCall struct {
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
-}
-
-type Tool struct {
-	Type     string       `json:"type"`
-	Function ToolFunction `json:"function"`
-}
-
-type ToolFunction struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters"`
+	Model     string            `json:"model"`
+	Messages  []json.RawMessage `json:"messages"`
+	Stream    bool              `json:"stream"`
+	ExtraBody map[string]any    `json:"extra_body,omitempty"`
+	// Tools/ToolChoice 保持原始 JSON 透传：上游可能带 function/custom/grammar
+	// 等任意形态，结构化解码会丢字段。
+	Tools      []json.RawMessage `json:"tools,omitempty"`
+	ToolChoice json.RawMessage   `json:"tool_choice,omitempty"`
 }
 
 type AppConfig struct {
@@ -804,16 +770,6 @@ func getForceDisableThinking() bool {
 	return forceDisableThinking
 }
 
-func getReasoningEffortMap() map[string]string {
-	configMu.RLock()
-	defer configMu.RUnlock()
-	cp := make(map[string]string, len(reasoningEffortMap))
-	for k, v := range reasoningEffortMap {
-		cp[k] = v
-	}
-	return cp
-}
-
 // ======================== Token 统计 ========================
 
 func loadTokenStats() {
@@ -859,162 +815,13 @@ func recordTokenUsage(model string, promptTokens, completionTokens, totalTokens 
 	go saveTokenStats()
 }
 
-// ======================== Thinking/Reasoning 判断 ========================
-
-func isThinkingEnabled(value any) bool {
-	switch v := value.(type) {
-	case map[string]any:
-		t, _ := v["type"].(string)
-		return t == "enabled"
-	case bool:
-		return v
-	default:
-		return false
-	}
-}
-
-func isThinkingDisabled(value any) bool {
-	switch v := value.(type) {
-	case map[string]any:
-		t, _ := v["type"].(string)
-		return t == "disabled"
-	case bool:
-		return !v
-	default:
-		return false
-	}
-}
-
-func wantsReasoning(req *OpenAIRequest) bool {
-	if getForceDisableThinking() {
-		return false
-	}
-	if isThinkingDisabled(req.Thinking) {
-		return false
-	}
-	if isThinkingEnabled(req.Thinking) {
-		return true
-	}
-	if req.ExtraBody != nil {
-		if isThinkingDisabled(req.ExtraBody["thinking"]) {
-			return false
-		}
-		if isThinkingEnabled(req.ExtraBody["thinking"]) {
-			return true
-		}
-	}
-	return true
-}
-
-// ======================== 消息处理 ========================
-// normalizeContent 是 dumb pipe 透传：保留 string 与 []any 两种入参形状
-// （其它非常规类型走 json.Marshal 兜底），不解析或过滤任何 multimodal part。
-// 能力协商由 opencode 客户端 + 上游负责；这里既不"硬降级"也不"补全"。
-func normalizeContent(content any) any {
-	if content == nil {
-		return nil
-	}
-	if s, ok := content.(string); ok {
-		return s
-	}
-	if arr, ok := content.([]any); ok {
-		return arr
-	}
-	b, err := json.Marshal(content)
-	if err != nil {
-		return nil
-	}
-	return string(b)
-}
-
-func fixToolCallGaps(messages []Message) []Message {
-	toolResponses := map[string]*Message{}
-	for i := range messages {
-		if messages[i].Role == "tool" && messages[i].ToolCallID != "" {
-			toolResponses[messages[i].ToolCallID] = &messages[i]
-		}
-	}
-	fixed := make([]Message, 0, len(messages)+len(messages)/4)
-	emitted := map[string]bool{}
-	for _, msg := range messages {
-		if msg.Role == "tool" && msg.ToolCallID != "" {
-			if emitted[msg.ToolCallID] {
-				continue
-			}
-		}
-		fixed = append(fixed, msg)
-		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
-			for _, tc := range msg.ToolCalls {
-				if resp, found := toolResponses[tc.ID]; found {
-					fixed = append(fixed, *resp)
-				} else {
-					fixed = append(fixed, Message{Role: "tool", ToolCallID: tc.ID, Content: "Tool call result not available"})
-				}
-				emitted[tc.ID] = true
-			}
-		}
-	}
-	return fixed
-}
-
-func ensureReasoningContent(messages []Message, thinking bool) []Message {
-	if !thinking {
-		return messages
-	}
-	for i := range messages {
-		if messages[i].Role == "assistant" && messages[i].ReasoningContent == nil {
-			empty := ""
-			messages[i].ReasoningContent = &empty
-		}
-	}
-	return messages
-}
-
-func convertMessagesForUpstream(messages []Message) []map[string]any {
-	converted := make([]map[string]any, 0, len(messages))
-	for _, msg := range messages {
-		clean := map[string]any{}
-		if msg.Role != "" {
-			clean["role"] = msg.Role
-		}
-		content := normalizeContent(msg.Content)
-		reasoningContent := msg.ReasoningContent
-		if content != nil {
-			clean["content"] = content
-		}
-		if reasoningContent != nil {
-			clean["reasoning_content"] = *reasoningContent
-		}
-		if len(msg.ToolCalls) > 0 {
-			clean["tool_calls"] = msg.ToolCalls
-		}
-		if msg.ToolCallID != "" {
-			clean["tool_call_id"] = msg.ToolCallID
-		}
-		if msg.Name != "" {
-			clean["name"] = msg.Name
-		}
-		converted = append(converted, clean)
-	}
-	return converted
-}
-
-// ======================== 完整请求转换（含 thinking/reasoning_effort/ExtraBody） ========================
+// ======================== 完整请求转换 ========================
 
 func convertRequest(req *OpenAIRequest) map[string]any {
 	converted := map[string]any{
 		"model":    req.Model,
-		"messages": convertMessagesForUpstream(req.Messages),
+		"messages": req.Messages,
 		"stream":   req.Stream,
-	}
-	if req.Temperature != nil {
-		converted["temperature"] = *req.Temperature
-	}
-	if req.MaxTokens != 0 {
-		converted["max_tokens"] = req.MaxTokens
-	}
-	if req.TopP != nil {
-		converted["top_p"] = *req.TopP
 	}
 	if len(req.Tools) > 0 {
 		converted["tools"] = req.Tools
@@ -1022,26 +829,8 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 	if req.ToolChoice != nil {
 		converted["tool_choice"] = req.ToolChoice
 	}
-	// 处理思维模式 — 仅当用户显式指定时才发送，避免 MiniMax 等模型报错
-	if getForceDisableThinking() || isThinkingDisabled(req.Thinking) {
+	if getForceDisableThinking() {
 		converted["thinking"] = map[string]string{"type": "disabled"}
-	} else if req.Thinking != nil && isThinkingEnabled(req.Thinking) {
-		converted["thinking"] = map[string]string{"type": "enabled"}
-	} else if req.ExtraBody != nil {
-		if isThinkingDisabled(req.ExtraBody["thinking"]) {
-			converted["thinking"] = map[string]string{"type": "disabled"}
-		} else if isThinkingEnabled(req.ExtraBody["thinking"]) {
-			converted["thinking"] = map[string]string{"type": "enabled"}
-		}
-	}
-	// 处理 reasoning_effort
-	if !getForceDisableThinking() && req.ReasoningEffort != "" {
-		effortMap := getReasoningEffortMap()
-		if mapped, ok := effortMap[req.ReasoningEffort]; ok {
-			converted["reasoning_effort"] = mapped
-		} else {
-			converted["reasoning_effort"] = req.ReasoningEffort
-		}
 	}
 	// 合并 ExtraBody
 	if req.ExtraBody != nil {
@@ -1055,6 +844,9 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 }
 
 func buildUpstreamBody(req *OpenAIRequest) []byte {
+	req.Messages = adaptCustomToolCalls(req.Messages)
+	req.Tools = adaptCustomTools(req.Tools)
+	req.ToolChoice = adaptCustomToolChoice(req.ToolChoice)
 	converted := convertRequest(req)
 	b, err := json.Marshal(converted)
 	if err != nil {
@@ -1063,333 +855,139 @@ func buildUpstreamBody(req *OpenAIRequest) []byte {
 	return b
 }
 
-// ======================== Anthropic 格式兼容 ========================
+// ======================== custom 工具适配 ========================
 
-func isAnthropicFormat(body []byte) bool {
-	var obj map[string]any
-	if json.Unmarshal(body, &obj) == nil {
-		if typ, _ := obj["type"].(string); typ == "message" {
-			return true
+// adaptCustomTools 把 opencode 上游不支持的 custom 工具声明转成 function，
+// 其余工具原样保留。
+func adaptCustomTools(tools []json.RawMessage) []json.RawMessage {
+	adapted := make([]json.RawMessage, 0, len(tools))
+	for _, raw := range tools {
+		var t struct {
+			Type   string           `json:"type"`
+			Custom *json.RawMessage `json:"custom"`
 		}
-	}
-	lines := bytes.Split(body, []byte("\n"))
-	for _, line := range lines {
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
+		if json.Unmarshal(raw, &t) != nil || t.Type != "custom" || t.Custom == nil {
+			adapted = append(adapted, raw)
 			continue
 		}
-		var event map[string]any
-		if err := json.Unmarshal(line, &event); err != nil {
+		var c struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		}
+		_ = json.Unmarshal(*t.Custom, &c)
+		fn := map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        c.Name,
+				"description": c.Description,
+				"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
+			},
+		}
+		b, err := json.Marshal(fn)
+		if err != nil {
+			adapted = append(adapted, raw)
 			continue
 		}
-		typ, _ := event["type"].(string)
-		switch typ {
-		case "message_start", "content_block_start", "content_block_delta",
-			"content_block_stop", "message_delta", "message_stop", "ping":
-			return true
-		}
-		return false
+		adapted = append(adapted, b)
 	}
-	return false
+	return adapted
 }
 
-func parseAnthropicSSE(body []byte) (map[string]any, string, []map[string]any) {
-	lines := bytes.Split(body, []byte("\n"))
-	var anthropicMsg map[string]any
-	var textBuilder, currentToolInputBuilder strings.Builder
-	var currentToolUse map[string]any
-	var toolUseBlocks []map[string]any
-	for _, line := range lines {
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
-			continue
-		}
-		var event map[string]any
-		if err := json.Unmarshal(line, &event); err != nil {
-			continue
-		}
-		typ, _ := event["type"].(string)
-		switch typ {
-		case "message_start":
-			if m, ok := event["message"].(map[string]any); ok {
-				anthropicMsg = m
-			}
-		case "content_block_start":
-			if cb, ok := event["content_block"].(map[string]any); ok {
-				if cbType, _ := cb["type"].(string); cbType == "tool_use" {
-					currentToolUse = cb
-					currentToolInputBuilder.Reset()
-				}
-			}
-		case "content_block_delta":
-			if delta, ok := event["delta"].(map[string]any); ok {
-				if t, ok := delta["text"].(string); ok {
-					textBuilder.WriteString(t)
-				}
-				if dt, _ := delta["type"].(string); dt == "input_json_delta" {
-					if partial, ok := delta["partial_json"].(string); ok {
-						currentToolInputBuilder.WriteString(partial)
-					}
-				}
-			}
-		case "content_block_stop":
-			if currentToolUse != nil {
-				inputStr := currentToolInputBuilder.String()
-				var input any = inputStr
-				var parsed any
-				if json.Unmarshal([]byte(inputStr), &parsed) == nil {
-					input = parsed
-				}
-				currentToolUse["input"] = input
-				toolUseBlocks = append(toolUseBlocks, currentToolUse)
-				currentToolUse = nil
-			}
-		case "message_delta":
-			if delta, ok := event["delta"].(map[string]any); ok {
-				if anthropicMsg == nil {
-					anthropicMsg = map[string]any{}
-				}
-				if stop, ok := delta["stop_reason"].(string); ok {
-					anthropicMsg["stop_reason"] = stop
-				}
-				if usage, ok := delta["usage"].(map[string]any); ok {
-					anthropicMsg["usage"] = usage
-				}
-			}
-		case "message_stop":
-		case "error":
-			return nil, "", nil
-		}
+// adaptCustomToolChoice 把 custom 强制选择降级为 auto：DeepSeek thinking
+// 模式不接受 function 强制 tool_choice，其余形态原样保留。
+func adaptCustomToolChoice(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 || string(raw) == "null" {
+		return raw
 	}
-	return anthropicMsg, textBuilder.String(), toolUseBlocks
+	var t struct {
+		Type   string           `json:"type"`
+		Custom *json.RawMessage `json:"custom"`
+	}
+	if json.Unmarshal(raw, &t) != nil || t.Type != "custom" || t.Custom == nil {
+		return raw
+	}
+	return json.RawMessage(`"auto"`)
 }
 
-func buildOpenAIResponse(anthropicMsg map[string]any, text string, toolUseBlocks []map[string]any, modelID string) []byte {
-	if anthropicMsg == nil {
-		return nil
-	}
-	now := time.Now().Unix()
-	role, _ := anthropicMsg["role"].(string)
-	if role == "" {
-		role = "assistant"
-	}
-	finishReason, _ := anthropicMsg["stop_reason"].(string)
-	if finishReason == "tool_use" {
-		finishReason = "tool_calls"
-	}
-	choice := map[string]any{
-		"index":         0,
-		"message":       map[string]any{"role": role, "content": text},
-		"finish_reason": finishReason,
-	}
-	if len(toolUseBlocks) > 0 {
-		var toolCalls []map[string]any
-		for _, tb := range toolUseBlocks {
-			toolInput := tb["input"]
-			argsJSON, _ := json.Marshal(toolInput)
-			toolCalls = append(toolCalls, map[string]any{
-				"id":   tb["id"],
+// adaptCustomToolCalls 把消息里 assistant 的 custom tool_calls 历史转成
+// function，其余消息字段保持原样。
+func adaptCustomToolCalls(messages []json.RawMessage) []json.RawMessage {
+	adapted := make([]json.RawMessage, 0, len(messages))
+	for _, raw := range messages {
+		var m struct {
+			Role      string            `json:"role"`
+			ToolCalls []json.RawMessage `json:"tool_calls"`
+		}
+		if json.Unmarshal(raw, &m) != nil || m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			adapted = append(adapted, raw)
+			continue
+		}
+		nextCalls := make([]json.RawMessage, 0, len(m.ToolCalls))
+		changed := false
+		for _, tcRaw := range m.ToolCalls {
+			var tc struct {
+				ID     string           `json:"id"`
+				Type   string           `json:"type"`
+				Custom *json.RawMessage `json:"custom"`
+			}
+			if json.Unmarshal(tcRaw, &tc) != nil || tc.Type != "custom" || tc.Custom == nil {
+				nextCalls = append(nextCalls, tcRaw)
+				continue
+			}
+			changed = true
+			var c struct {
+				Name  string `json:"name"`
+				Input string `json:"input"`
+			}
+			_ = json.Unmarshal(*tc.Custom, &c)
+			b, err := json.Marshal(map[string]any{
+				"id":   tc.ID,
 				"type": "function",
 				"function": map[string]any{
-					"name":      tb["name"],
-					"arguments": string(argsJSON),
+					"name":      c.Name,
+					"arguments": c.Input,
 				},
 			})
-		}
-		choice["message"].(map[string]any)["tool_calls"] = toolCalls
-		if text == "" {
-			choice["message"].(map[string]any)["content"] = nil
-		}
-	}
-	resp := map[string]any{
-		"id":      anthropicMsg["id"],
-		"object":  "chat.completion",
-		"created": now,
-		"model":   modelID,
-		"choices": []map[string]any{choice},
-	}
-	if usage, ok := anthropicMsg["usage"]; ok {
-		resp["usage"] = usage
-	}
-	result, _ := json.Marshal(resp)
-	return result
-}
-
-func convertAnthropicMessageToOpenAI(msg map[string]any, modelID string) []byte {
-	if msg["model"] == nil {
-		msg["model"] = modelID
-	}
-	var textBuilder strings.Builder
-	var toolUses []map[string]any
-	if content, ok := msg["content"].([]any); ok {
-		for _, c := range content {
-			if block, ok := c.(map[string]any); ok {
-				switch block["type"] {
-				case "text":
-					if t, ok := block["text"].(string); ok {
-						textBuilder.WriteString(t)
-					}
-				case "tool_use":
-					toolUses = append(toolUses, block)
-				}
+			if err != nil {
+				nextCalls = append(nextCalls, tcRaw)
+				continue
 			}
+			nextCalls = append(nextCalls, b)
 		}
-	}
-	return buildOpenAIResponse(msg, textBuilder.String(), toolUses, modelID)
-}
-
-func convertAnthropicToOpenAI(body []byte, modelID string) []byte {
-	var singleMsg map[string]any
-	if json.Unmarshal(body, &singleMsg) == nil {
-		if typ, _ := singleMsg["type"].(string); typ == "message" {
-			return convertAnthropicMessageToOpenAI(singleMsg, modelID)
-		}
-	}
-	msg, text, toolUses := parseAnthropicSSE(body)
-	if msg == nil {
-		return body
-	}
-	if msg["model"] == nil {
-		msg["model"] = modelID
-	}
-	return buildOpenAIResponse(msg, text, toolUses, modelID)
-}
-
-// ======================== 响应清理 ========================
-
-func cleanNulls(m map[string]any) {
-	for k, v := range m {
-		if v == nil {
-			delete(m, k)
+		if !changed {
+			adapted = append(adapted, raw)
 			continue
 		}
-		if s, ok := v.(string); ok && s == "" {
-			delete(m, k)
+		var msgMap map[string]any
+		if json.Unmarshal(raw, &msgMap) != nil {
+			adapted = append(adapted, raw)
+			continue
 		}
+		msgMap["tool_calls"] = nextCalls
+		b, err := json.Marshal(msgMap)
+		if err != nil {
+			adapted = append(adapted, raw)
+			continue
+		}
+		adapted = append(adapted, b)
 	}
+	return adapted
 }
 
-func cleanStreamDelta(delta map[string]any, keepReasoning bool) {
-	if v, ok := delta["content"]; ok && v == nil {
-		delete(delta, "content")
-	}
-	if s, ok := delta["content"].(string); ok && s == "" {
-		delete(delta, "content")
-	}
-	if !keepReasoning {
-		delete(delta, "reasoning_content")
-	} else {
-		if v, ok := delta["reasoning_content"]; ok && v == nil {
-			delete(delta, "reasoning_content")
-		}
-		if s, ok := delta["reasoning_content"].(string); ok && s == "" {
-			delete(delta, "reasoning_content")
-		}
-	}
-	if s, ok := delta["role"].(string); ok && s == "" {
-		delete(delta, "role")
-	}
-}
+// ======================== 响应透传 ========================
 
-// convertStreamChunkWithUsage 转换流式 chunk 并同时提取 usage，避免二次解析
-func convertStreamChunkWithUsage(line string, keepReasoning bool) (string, map[string]any) {
+// extractUsage 只解析 SSE 行中的 usage 用于 token 统计，响应内容本身原样透传
+func extractUsage(line string) map[string]any {
 	trimmed := strings.TrimSpace(line)
-	if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
-		return line, nil
+	if !strings.HasPrefix(trimmed, "data: ") {
+		return nil
 	}
-	if !strings.HasPrefix(line, "data: ") {
-		return line, nil
-	}
-	data := line[6:]
 	var raw map[string]any
-	if err := json.Unmarshal([]byte(data), &raw); err != nil {
-		return line, nil
+	if err := json.Unmarshal([]byte(strings.TrimSpace(trimmed[6:])), &raw); err != nil {
+		return nil
 	}
-
-	// 提取 usage
-	var usage map[string]any
-	if u, ok := raw["usage"].(map[string]any); ok {
-		usage = u
-	}
-
-	choices, ok := raw["choices"].([]any)
-	if !ok || len(choices) == 0 {
-		return "", usage
-	}
-	for i, c := range choices {
-		choice, ok := c.(map[string]any)
-		if !ok {
-			continue
-		}
-		if delta, ok := choice["delta"].(map[string]any); ok {
-			cleanStreamDelta(delta, keepReasoning)
-			choice["delta"] = delta
-		}
-		if msg, ok := choice["message"].(map[string]any); ok {
-			cleanNulls(msg)
-			if !keepReasoning {
-				delete(msg, "reasoning_content")
-			}
-			choice["message"] = msg
-		}
-		if v, ok := choice["logprobs"]; ok && v == nil {
-			delete(choice, "logprobs")
-		}
-		if v, ok := choice["finish_reason"]; ok && v == nil {
-			delete(choice, "finish_reason")
-		}
-		if s, ok := choice["finish_reason"].(string); ok && s == "" {
-			delete(choice, "finish_reason")
-		}
-		choices[i] = choice
-	}
-	raw["choices"] = choices
-	if v, ok := raw["usage"]; ok && v == nil {
-		delete(raw, "usage")
-	}
-	delete(raw, "cost")
-	converted, err := json.Marshal(raw)
-	if err != nil {
-		return line, usage
-	}
-	return "data: " + string(converted), usage
-}
-
-func convertResponse(data []byte, keepReasoning bool) ([]byte, error) {
-	var raw map[string]any
-	if err := json.Unmarshal(data, &raw); err != nil {
-		slog.Warn("convertResponse unmarshal failed", "error", err)
-		return data, nil
-	}
-	if choices, ok := raw["choices"].([]any); ok {
-		for i, c := range choices {
-			if choice, ok := c.(map[string]any); ok {
-				if msg, ok := choice["message"].(map[string]any); ok {
-					cleanNulls(msg)
-					if !keepReasoning {
-						delete(msg, "reasoning_content")
-					}
-					choice["message"] = msg
-				}
-				if v, ok := choice["logprobs"]; ok && v == nil {
-					delete(choice, "logprobs")
-				}
-				choices[i] = choice
-			}
-		}
-		raw["choices"] = choices
-	}
-	if usage, ok := raw["usage"].(map[string]any); ok {
-		cleanU := map[string]any{
-			"prompt_tokens":     usage["prompt_tokens"],
-			"completion_tokens": usage["completion_tokens"],
-			"total_tokens":      usage["total_tokens"],
-		}
-		raw["usage"] = cleanU
-	}
-	delete(raw, "cost")
-	delete(raw, "system_fingerprint")
-	return json.Marshal(raw)
+	usage, _ := raw["usage"].(map[string]any)
+	return usage
 }
 
 // ======================== 认证层级 ========================
@@ -1483,7 +1081,6 @@ func buildOCRequest(modelID string, bodyMap map[string]any, auth UpstreamAuth) (
 
 func buildOCRequestWithEndpoint(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool) (*http.Request, error) {
 	bodyMap["model"] = modelID
-	delete(bodyMap, "reasoning_effort")
 	tryBody, err := json.Marshal(bodyMap)
 	if err != nil {
 		return nil, err
@@ -1570,9 +1167,6 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, auth UpstreamAuth) ([]
 			resp.Body.Close()
 			if readErr != nil {
 				return nil, 0, nil, readErr
-			}
-			if isAnthropicFormat(b) {
-				b = convertAnthropicToOpenAI(b, tryModel)
 			}
 			return b, resp.StatusCode, resp.Header, nil
 		}
@@ -1724,9 +1318,6 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 多模态路由：检测到图片时转发到配置的上游
 
-	req.Messages = fixToolCallGaps(req.Messages)
-	keepReasoning := wantsReasoning(&req)
-	req.Messages = ensureReasoningContent(req.Messages, keepReasoning)
 	if req.Stream {
 		if req.ExtraBody == nil {
 			req.ExtraBody = map[string]any{}
@@ -1784,22 +1375,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			out, usage := convertStreamChunkWithUsage(line, keepReasoning)
-			if out == "" {
-				// 空choices chunk，但可能有 usage
-				if usage != nil {
-					pt, _ := usage["prompt_tokens"].(float64)
-					ct, _ := usage["completion_tokens"].(float64)
-					tt, _ := usage["total_tokens"].(float64)
-					if tt > 0 {
-						recordTokenUsage(req.Model, int64(pt), int64(ct), int64(tt))
-					}
-				}
-				continue
-			}
-
-			// 提取 usage（已在 convertStreamChunkWithUsage 中解析）
-			if usage != nil && !doneSeen {
+			usage := extractUsage(line)
+			if usage != nil {
 				pt, _ := usage["prompt_tokens"].(float64)
 				ct, _ := usage["completion_tokens"].(float64)
 				tt, _ := usage["total_tokens"].(float64)
@@ -1808,8 +1385,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			w.Write([]byte(out))
-			w.Write([]byte("\n"))
+			w.Write([]byte(line))
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
@@ -1829,10 +1405,6 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	outBody := respBody
-	convertedResp, err := convertResponse(respBody, keepReasoning)
-	if err == nil {
-		outBody = convertedResp
-	}
 	// Record token usage
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {

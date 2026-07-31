@@ -22,7 +22,7 @@ cp config.example.json config.json
 
 ### `reasoning_effort_map`
 
-把客户端传入的 `reasoning_effort` 映射到上游可接受的值。
+仅保留在管理面板中，不再参与请求转换。
 
 ```json
 {
@@ -36,7 +36,7 @@ cp config.example.json config.json
 
 ### `force_disable_thinking`
 
-设为 `true` 时，服务会尽量禁用 thinking/reasoning，并从返回中移除 reasoning 内容。
+设为 `true` 时，服务会在请求中强制写入 `thinking: {"type":"disabled"}`。
 
 ### `socks5_proxies`
 
