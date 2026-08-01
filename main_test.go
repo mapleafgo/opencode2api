@@ -303,72 +303,92 @@ func TestCallOpenCodeAPIExhausted4xxReturnsLastUpstreamResponse(t *testing.T) {
 	}
 }
 
-func TestCustomToolsAdaptedToFunctionForUpstream(t *testing.T) {
+func TestNonFunctionToolsRejected(t *testing.T) {
+	installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+		{status: http.StatusOK, body: `{"id":"chatcmpl_test","choices":[]}`},
+	})
+
+	// 非 function 类型的工具声明、tool_calls 历史、tool_choice 都应被拒绝 400
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "custom tool declaration",
+			body: `{
+				"model":"primary-model",
+				"messages":[{"role":"user","content":"x"}],
+				"tools":[{"type":"custom","custom":{"name":"parse","format":{"type":"grammar","grammar":{"syntax":"lark","definition":"start: /[0-9]+/"}}}}]
+			}`,
+		},
+		{
+			name: "custom tool_call in history",
+			body: `{
+				"model":"primary-model",
+				"messages":[
+					{"role":"user","content":"x"},
+					{"role":"assistant","tool_calls":[{"id":"call_c","type":"custom","custom":{"name":"parse","input":"42"}}]},
+					{"role":"tool","tool_call_id":"call_c","content":"ok"}
+				]
+			}`,
+		},
+		{
+			name: "custom tool_choice",
+			body: `{
+				"model":"primary-model",
+				"messages":[{"role":"user","content":"x"}],
+				"tool_choice":{"type":"custom","custom":{"name":"parse"}}
+			}`,
+		},
+		{
+			name: "unknown tool type",
+			body: `{
+				"model":"primary-model",
+				"messages":[{"role":"user","content":"x"}],
+				"tools":[{"type":"grammar","grammar":{"syntax":"lark","definition":"start: /[a-z]+/"}}]
+			}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tt.body))
+			rec := httptest.NewRecorder()
+			chatCompletionsHandler(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d for %s", rec.Code, http.StatusBadRequest, tt.name)
+			}
+			if !strings.Contains(rec.Body.String(), "only function tools are supported") {
+				t.Fatalf("response body = %s, want error about function-only tools", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestFunctionToolsAccepted(t *testing.T) {
 	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
 		{status: http.StatusOK, body: `{"id":"chatcmpl_test","choices":[]}`},
 	})
 
+	// 纯 function 工具应该正常通过，不被拒绝
 	body := `{
 		"model":"primary-model",
 		"messages":[
 			{"role":"user","content":"x"},
-			{"role":"assistant","tool_calls":[{"id":"call_c","type":"custom","custom":{"name":"parse","input":"42"}}]},
-			{"role":"tool","tool_call_id":"call_c","content":"ok"}
+			{"role":"assistant","tool_calls":[{"id":"call_f","type":"function","function":{"name":"f","arguments":"{\"q\":1}"}}]},
+			{"role":"tool","tool_call_id":"call_f","content":"ok"}
 		],
-		"tools":[
-			{"type":"function","function":{"name":"f","description":"","parameters":{"type":"object"}}},
-			{"type":"custom","custom":{"name":"parse","description":"parse csv","format":{"type":"grammar","grammar":{"syntax":"lark","definition":"start: /[0-9]+/"}}}}
-		],
-		"tool_choice":{"type":"custom","custom":{"name":"parse"}}
+		"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
+		"tool_choice":"auto"
 	}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	chatCompletionsHandler(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("chatCompletionsHandler() status = %d, want %d", rec.Code, http.StatusOK)
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
 	if len(transport.requestPayloads) != 1 {
 		t.Fatalf("upstream requests = %d, want 1", len(transport.requestPayloads))
-	}
-	payload := transport.requestPayloads[0]
-
-	toolsRaw, err := json.Marshal(payload["tools"])
-	if err != nil {
-		t.Fatal(err)
-	}
-	tools := string(toolsRaw)
-	for _, want := range []string{`"type":"function"`, `"name":"parse"`, `"description":"parse csv"`} {
-		if !strings.Contains(tools, want) {
-			t.Fatalf("upstream tools = %s, want it to contain %s", tools, want)
-		}
-	}
-	if strings.Contains(tools, `"type":"custom"`) || strings.Contains(tools, `"grammar"`) {
-		t.Fatalf("custom tool was not adapted to function: %s", tools)
-	}
-
-	choiceRaw, err := json.Marshal(payload["tool_choice"])
-	if err != nil {
-		t.Fatal(err)
-	}
-	choice := string(choiceRaw)
-	if choice != `"auto"` {
-		t.Fatalf("upstream tool_choice = %s, want auto", choice)
-	}
-
-	msgs, ok := payload["messages"].([]any)
-	if !ok || len(msgs) < 2 {
-		t.Fatalf("upstream messages = %#v", payload["messages"])
-	}
-	callRaw, err := json.Marshal(msgs[1])
-	if err != nil {
-		t.Fatal(err)
-	}
-	call := string(callRaw)
-	if !strings.Contains(call, `"type":"function"`) || !strings.Contains(call, `"name":"parse"`) || !strings.Contains(call, `"arguments":"42"`) {
-		t.Fatalf("upstream tool_calls = %s, want function adaptation", call)
-	}
-	if strings.Contains(call, `"type":"custom"`) || strings.Contains(call, `"custom"`) {
-		t.Fatalf("custom tool_call was not adapted to function: %s", call)
 	}
 }
 

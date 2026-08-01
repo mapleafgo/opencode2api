@@ -692,8 +692,7 @@ type OpenAIRequest struct {
 	Messages  []json.RawMessage `json:"messages"`
 	Stream    bool              `json:"stream"`
 	ExtraBody map[string]any    `json:"extra_body,omitempty"`
-	// Tools/ToolChoice 保持原始 JSON 透传：上游可能带 function/custom/grammar
-	// 等任意形态，结构化解码会丢字段。
+	// Tools/ToolChoice 保持原始 JSON 透传，仅接受 function 形态，其余类型一律拒绝。
 	Tools      []json.RawMessage `json:"tools,omitempty"`
 	ToolChoice json.RawMessage   `json:"tool_choice,omitempty"`
 }
@@ -844,9 +843,6 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 }
 
 func buildUpstreamBody(req *OpenAIRequest) []byte {
-	req.Messages = adaptCustomToolCalls(req.Messages)
-	req.Tools = adaptCustomTools(req.Tools)
-	req.ToolChoice = adaptCustomToolChoice(req.ToolChoice)
 	converted := convertRequest(req)
 	b, err := json.Marshal(converted)
 	if err != nil {
@@ -855,123 +851,49 @@ func buildUpstreamBody(req *OpenAIRequest) []byte {
 	return b
 }
 
-// ======================== custom 工具适配 ========================
+// ======================== 工具类型校验 ========================
 
-// adaptCustomTools 把 opencode 上游不支持的 custom 工具声明转成 function，
-// 其余工具原样保留。
-func adaptCustomTools(tools []json.RawMessage) []json.RawMessage {
-	adapted := make([]json.RawMessage, 0, len(tools))
-	for _, raw := range tools {
+// hasNonFunctionTool 检测请求中是否存在非 function 类型的工具声明、
+// tool_calls 或 tool_choice。本代理只接受 function 工具，其余形态
+// （custom、grammar 等）一律拒绝（400），不再静默转成 function。
+func hasNonFunctionTool(req *OpenAIRequest) bool {
+	// tools 声明：只要 type 不是 function 就拒绝
+	for _, raw := range req.Tools {
 		var t struct {
-			Type   string           `json:"type"`
-			Custom *json.RawMessage `json:"custom"`
+			Type string `json:"type"`
 		}
-		if json.Unmarshal(raw, &t) != nil || t.Type != "custom" || t.Custom == nil {
-			adapted = append(adapted, raw)
-			continue
+		if json.Unmarshal(raw, &t) != nil || t.Type != "function" {
+			return true
 		}
-		var c struct {
-			Name        string `json:"name"`
-			Description string `json:"description"`
-		}
-		_ = json.Unmarshal(*t.Custom, &c)
-		fn := map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name":        c.Name,
-				"description": c.Description,
-				"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
-			},
-		}
-		b, err := json.Marshal(fn)
-		if err != nil {
-			adapted = append(adapted, raw)
-			continue
-		}
-		adapted = append(adapted, b)
 	}
-	return adapted
-}
-
-// adaptCustomToolChoice 把 custom 强制选择降级为 auto：DeepSeek thinking
-// 模式不接受 function 强制 tool_choice，其余形态原样保留。
-func adaptCustomToolChoice(raw json.RawMessage) json.RawMessage {
-	if len(raw) == 0 || string(raw) == "null" {
-		return raw
+	// tool_choice：对象形态时 type 必须是 function，字符串形态（auto/none/required）放行
+	if len(req.ToolChoice) > 0 && string(req.ToolChoice) != "null" {
+		var t struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(req.ToolChoice, &t) == nil && t.Type != "" && t.Type != "function" {
+			return true
+		}
 	}
-	var t struct {
-		Type   string           `json:"type"`
-		Custom *json.RawMessage `json:"custom"`
-	}
-	if json.Unmarshal(raw, &t) != nil || t.Type != "custom" || t.Custom == nil {
-		return raw
-	}
-	return json.RawMessage(`"auto"`)
-}
-
-// adaptCustomToolCalls 把消息里 assistant 的 custom tool_calls 历史转成
-// function，其余消息字段保持原样。
-func adaptCustomToolCalls(messages []json.RawMessage) []json.RawMessage {
-	adapted := make([]json.RawMessage, 0, len(messages))
-	for _, raw := range messages {
+	// 消息历史中的 assistant tool_calls：type 必须是 function
+	for _, raw := range req.Messages {
 		var m struct {
 			Role      string            `json:"role"`
 			ToolCalls []json.RawMessage `json:"tool_calls"`
 		}
 		if json.Unmarshal(raw, &m) != nil || m.Role != "assistant" || len(m.ToolCalls) == 0 {
-			adapted = append(adapted, raw)
 			continue
 		}
-		nextCalls := make([]json.RawMessage, 0, len(m.ToolCalls))
-		changed := false
 		for _, tcRaw := range m.ToolCalls {
 			var tc struct {
-				ID     string           `json:"id"`
-				Type   string           `json:"type"`
-				Custom *json.RawMessage `json:"custom"`
+				Type string `json:"type"`
 			}
-			if json.Unmarshal(tcRaw, &tc) != nil || tc.Type != "custom" || tc.Custom == nil {
-				nextCalls = append(nextCalls, tcRaw)
-				continue
+			if json.Unmarshal(tcRaw, &tc) != nil || tc.Type != "function" {
+				return true
 			}
-			changed = true
-			var c struct {
-				Name  string `json:"name"`
-				Input string `json:"input"`
-			}
-			_ = json.Unmarshal(*tc.Custom, &c)
-			b, err := json.Marshal(map[string]any{
-				"id":   tc.ID,
-				"type": "function",
-				"function": map[string]any{
-					"name":      c.Name,
-					"arguments": c.Input,
-				},
-			})
-			if err != nil {
-				nextCalls = append(nextCalls, tcRaw)
-				continue
-			}
-			nextCalls = append(nextCalls, b)
 		}
-		if !changed {
-			adapted = append(adapted, raw)
-			continue
-		}
-		var msgMap map[string]any
-		if json.Unmarshal(raw, &msgMap) != nil {
-			adapted = append(adapted, raw)
-			continue
-		}
-		msgMap["tool_calls"] = nextCalls
-		b, err := json.Marshal(msgMap)
-		if err != nil {
-			adapted = append(adapted, raw)
-			continue
-		}
-		adapted = append(adapted, b)
 	}
-	return adapted
+	return false
 }
 
 // ======================== 响应透传 ========================
@@ -1323,6 +1245,17 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			req.ExtraBody = map[string]any{}
 		}
 		req.ExtraBody["stream_options"] = map[string]any{"include_usage": true}
+	}
+	// 只接受 function 工具，其余形态一律拒绝
+	if hasNonFunctionTool(&req) {
+		slog.Info("rejected non-function tool", "model", req.Model, "stream", req.Stream)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+			"message": "only function tools are supported; custom and other tool types are not accepted",
+			"type":    "invalid_request_error",
+		}})
+		return
 	}
 	upstreamBody := buildUpstreamBody(&req)
 
