@@ -303,68 +303,6 @@ func TestCallOpenCodeAPIExhausted4xxReturnsLastUpstreamResponse(t *testing.T) {
 	}
 }
 
-func TestNonFunctionToolsRejected(t *testing.T) {
-	installFakeOpenCodeClient(t, []fakeUpstreamResponse{
-		{status: http.StatusOK, body: `{"id":"chatcmpl_test","choices":[]}`},
-	})
-
-	// 非 function 类型的工具声明、tool_calls 历史、tool_choice 都应被拒绝 400
-	tests := []struct {
-		name string
-		body string
-	}{
-		{
-			name: "custom tool declaration",
-			body: `{
-				"model":"primary-model",
-				"messages":[{"role":"user","content":"x"}],
-				"tools":[{"type":"custom","custom":{"name":"parse","format":{"type":"grammar","grammar":{"syntax":"lark","definition":"start: /[0-9]+/"}}}}]
-			}`,
-		},
-		{
-			name: "custom tool_call in history",
-			body: `{
-				"model":"primary-model",
-				"messages":[
-					{"role":"user","content":"x"},
-					{"role":"assistant","tool_calls":[{"id":"call_c","type":"custom","custom":{"name":"parse","input":"42"}}]},
-					{"role":"tool","tool_call_id":"call_c","content":"ok"}
-				]
-			}`,
-		},
-		{
-			name: "custom tool_choice",
-			body: `{
-				"model":"primary-model",
-				"messages":[{"role":"user","content":"x"}],
-				"tool_choice":{"type":"custom","custom":{"name":"parse"}}
-			}`,
-		},
-		{
-			name: "unknown tool type",
-			body: `{
-				"model":"primary-model",
-				"messages":[{"role":"user","content":"x"}],
-				"tools":[{"type":"grammar","grammar":{"syntax":"lark","definition":"start: /[a-z]+/"}}]
-			}`,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tt.body))
-			rec := httptest.NewRecorder()
-			chatCompletionsHandler(rec, req)
-			if rec.Code != http.StatusBadRequest {
-				t.Fatalf("status = %d, want %d for %s", rec.Code, http.StatusBadRequest, tt.name)
-			}
-			if !strings.Contains(rec.Body.String(), "only function tools are supported") {
-				t.Fatalf("response body = %s, want error about function-only tools", rec.Body.String())
-			}
-		})
-	}
-}
-
 func TestFunctionToolsAccepted(t *testing.T) {
 	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
 		{status: http.StatusOK, body: `{"id":"chatcmpl_test","choices":[]}`},
@@ -389,6 +327,270 @@ func TestFunctionToolsAccepted(t *testing.T) {
 	}
 	if len(transport.requestPayloads) != 1 {
 		t.Fatalf("upstream requests = %d, want 1", len(transport.requestPayloads))
+	}
+}
+
+func TestChatForwardsTopLevelParamsAndThinking(t *testing.T) {
+	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+		{status: http.StatusOK, body: `{"id":"chatcmpl_test","choices":[]}`},
+	})
+
+	body := `{
+		"model":"primary-model",
+		"messages":[{"role":"user","content":"x"}],
+		"temperature":0.7,
+		"max_tokens":512,
+		"top_p":0.9,
+		"thinking":{"type":"enabled"},
+		"reasoning_effort":"high"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	chatCompletionsHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	up := transport.requestPayloads[0]
+	if got, ok := up["temperature"].(float64); !ok || got != 0.7 {
+		t.Fatalf("temperature = %#v, want 0.7", up["temperature"])
+	}
+	if got, ok := up["max_tokens"].(float64); !ok || got != 512 {
+		t.Fatalf("max_tokens = %#v, want 512", up["max_tokens"])
+	}
+	if got, ok := up["top_p"].(float64); !ok || got != 0.9 {
+		t.Fatalf("top_p = %#v, want 0.9", up["top_p"])
+	}
+	if got, ok := up["thinking"].(map[string]any); !ok || got["type"] != "enabled" {
+		t.Fatalf("thinking = %#v, want enabled passthrough", up["thinking"])
+	}
+	if got, ok := up["reasoning_effort"].(string); !ok || got != "high" {
+		t.Fatalf("reasoning_effort = %#v, want high", up["reasoning_effort"])
+	}
+}
+
+func TestChatReasoningEffortMapped(t *testing.T) {
+	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+		{status: http.StatusOK, body: `{"id":"chatcmpl_1","choices":[]}`},
+		{status: http.StatusOK, body: `{"id":"chatcmpl_2","choices":[]}`},
+	})
+
+	configMu.Lock()
+	old := reasoningEffortMap
+	reasoningEffortMap = map[string]string{"high": "max"}
+	configMu.Unlock()
+	t.Cleanup(func() {
+		configMu.Lock()
+		reasoningEffortMap = old
+		configMu.Unlock()
+	})
+
+	// 配置了映射的档位按映射值传给上游
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{
+			"model":"primary-model",
+			"messages":[{"role":"user","content":"x"}],
+			"reasoning_effort":"high"
+		}`))
+	rec := httptest.NewRecorder()
+	chatCompletionsHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got, ok := transport.requestPayloads[0]["reasoning_effort"].(string); !ok || got != "max" {
+		t.Fatalf("mapped reasoning_effort = %#v, want max", transport.requestPayloads[0]["reasoning_effort"])
+	}
+
+	// 未配置的档位原样透传
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{
+			"model":"primary-model",
+			"messages":[{"role":"user","content":"x"}],
+			"reasoning_effort":"low"
+		}`))
+	rec = httptest.NewRecorder()
+	chatCompletionsHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got, ok := transport.requestPayloads[1]["reasoning_effort"].(string); !ok || got != "low" {
+		t.Fatalf("passthrough reasoning_effort = %#v, want low", transport.requestPayloads[1]["reasoning_effort"])
+	}
+}
+
+func TestChatMapsMaxCompletionTokensToMaxTokens(t *testing.T) {
+	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+		{status: http.StatusOK, body: `{"id":"chatcmpl_test","choices":[]}`},
+	})
+
+	// 仅发新字段 max_completion_tokens，上游应收到 max_tokens
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{
+			"model":"primary-model",
+			"messages":[{"role":"user","content":"x"}],
+			"max_completion_tokens":2048
+		}`))
+	rec := httptest.NewRecorder()
+	chatCompletionsHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	up := transport.requestPayloads[0]
+	if got, ok := up["max_tokens"].(float64); !ok || got != 2048 {
+		t.Fatalf("max_tokens = %#v, want 2048", up["max_tokens"])
+	}
+	if _, ok := up["max_completion_tokens"]; ok {
+		t.Fatalf("max_completion_tokens should not reach upstream, got %#v", up["max_completion_tokens"])
+	}
+}
+
+func TestNormalizeErrorBody(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		msg  string
+		typ  string
+		code string
+	}{
+		{
+			name: "full upstream error",
+			body: `{"error":{"message":"ctx too small","type":"invalid_request_error","code":"context_length_exceeded"}}`,
+			msg:  "ctx too small", typ: "invalid_request_error", code: "context_length_exceeded",
+		},
+		{
+			name: "missing code",
+			body: `{"error":{"message":"boom","type":"server_error"}}`,
+			msg:  "boom", typ: "server_error", code: "",
+		},
+		{
+			name: "numeric code normalized to string",
+			body: `{"error":{"message":"rate limited","type":"rate_limit_error","code":429}}`,
+			msg:  "rate limited", typ: "rate_limit_error", code: "429",
+		},
+		{
+			name: "garbage body falls back",
+			body: `not json`,
+			msg:  "upstream error", typ: "upstream_error", code: "",
+		},
+		{
+			name: "detail fallback",
+			body: `{"detail":"Rate limit exceeded"}`,
+			msg:  "Rate limit exceeded", typ: "upstream_error", code: "",
+		},
+		{
+			name: "error string fallback",
+			body: `{"error":"rate limited"}`,
+			msg:  "rate limited", typ: "upstream_error", code: "",
+		},
+		{
+			name: "top-level message fallback",
+			body: `{"message":"boom"}`,
+			msg:  "boom", typ: "upstream_error", code: "",
+		},
+		{
+			name: "null error ignores openai branch",
+			body: `{"error":null,"message":"boom"}`,
+			msg:  "boom", typ: "upstream_error", code: "",
+		},
+		{
+			name: "empty error object falls back",
+			body: `{"error":{},"message":"boom"}`,
+			msg:  "boom", typ: "upstream_error", code: "",
+		},
+		{
+			name: "empty body falls back",
+			body: ``,
+			msg:  "upstream error", typ: "upstream_error", code: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizeErrorBody([]byte(tt.body), "upstream_error")
+			if got.Message != tt.msg || got.Type != tt.typ || got.Code != tt.code {
+				t.Fatalf("normalizeErrorBody() = %+v, want message=%q type=%q code=%q", got, tt.msg, tt.typ, tt.code)
+			}
+		})
+	}
+}
+
+func TestChatNonStreamErrorStandardized(t *testing.T) {
+	installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+		{status: http.StatusBadRequest, body: `{"error":{"message":"ctx too small","type":"invalid_request_error","code":"context_length_exceeded"}}`},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"primary-model","messages":[{"role":"user","content":"x"}]}`))
+	rec := httptest.NewRecorder()
+	chatCompletionsHandler(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+	var out struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal error body: %v", err)
+	}
+	if out.Error.Message != "ctx too small" || out.Error.Type != "invalid_request_error" || out.Error.Code != "context_length_exceeded" {
+		t.Fatalf("standardized error = %+v", out.Error)
+	}
+}
+
+func TestSendStreamErrorWritesFailureTerminal(t *testing.T) {
+	rec := httptest.NewRecorder()
+	sendStreamError(rec, "m", openAIError{
+		Message: "stream read error",
+		Type:    "stream_error",
+		Code:    "context_length_exceeded",
+	})
+	body := rec.Body.String()
+	if !strings.Contains(body, `"finish_reason":"error"`) {
+		t.Fatalf("missing finish_reason=error terminal: %s", body)
+	}
+	if !strings.Contains(body, `"code":"context_length_exceeded"`) {
+		t.Fatalf("missing error code: %s", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("missing [DONE] sentinel: %s", body)
+	}
+}
+
+func TestFixToolCallGapsReordersAndDedupes(t *testing.T) {
+	mixed := []json.RawMessage{
+		json.RawMessage(`{"role":"user","content":"x"}`),
+		json.RawMessage(`{"role":"assistant","tool_calls":[{"id":"a"},{"id":"b"}]}`),
+		json.RawMessage(`{"role":"tool","tool_call_id":"a","content":"A"}`),
+		json.RawMessage(`{"role":"tool","tool_call_id":"a","content":"A-dup"}`),
+	}
+
+	got := fixToolCallGaps(mixed)
+	// 期望：user、assistant、tool a（去重取最后一条）、tool b（缺失补占位）
+	wantIDs := []string{"a", "b"}
+	var roles []string
+	var ids []string
+	for _, raw := range got {
+		var m struct {
+			Role       string `json:"role"`
+			ToolCallID string `json:"tool_call_id"`
+			Content    string `json:"content"`
+		}
+		_ = json.Unmarshal(raw, &m)
+		roles = append(roles, m.Role)
+		if m.Role == "tool" {
+			ids = append(ids, m.ToolCallID)
+			if m.Content == "" {
+				t.Fatalf("tool %s content empty; raw=%s", m.ToolCallID, raw)
+			}
+		}
+	}
+	if wantRoles := []string{"user", "assistant", "tool", "tool"}; !reflect.DeepEqual(roles, wantRoles) {
+		t.Fatalf("roles = %v, want %v", roles, wantRoles)
+	}
+	if !reflect.DeepEqual(ids, wantIDs) {
+		t.Fatalf("tool ids = %v, want %v", ids, wantIDs)
 	}
 }
 

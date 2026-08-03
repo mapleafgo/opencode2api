@@ -11,9 +11,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -574,13 +576,12 @@ func getReqID(ctx context.Context) string {
 // ======================== 配置 ========================
 
 var (
-	port                 string
-	configPath           = "config.json"
-	modelAlias           = map[string]string{}
-	reasoningEffortMap   = map[string]string{}
-	forceDisableThinking bool
-	debugMode            bool
-	configMu             sync.RWMutex
+	port               string
+	configPath         = "config.json"
+	modelAlias         = map[string]string{}
+	reasoningEffortMap = map[string]string{}
+	debugMode          bool
+	configMu           sync.RWMutex
 )
 
 // ======================== 管理面板认证 ========================
@@ -688,21 +689,26 @@ var (
 // ======================== 数据模型 ========================
 
 type OpenAIRequest struct {
-	Model     string            `json:"model"`
-	Messages  []json.RawMessage `json:"messages"`
-	Stream    bool              `json:"stream"`
-	ExtraBody map[string]any    `json:"extra_body,omitempty"`
-	// Tools/ToolChoice 保持原始 JSON 透传，仅接受 function 形态，其余类型一律拒绝。
+	Model               string            `json:"model"`
+	Messages            []json.RawMessage `json:"messages"`
+	Stream              bool              `json:"stream"`
+	Temperature         *float64          `json:"temperature,omitempty"`
+	MaxTokens           int               `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int               `json:"max_completion_tokens,omitempty"`
+	TopP                *float64          `json:"top_p,omitempty"`
+	Thinking            any               `json:"thinking,omitempty"`
+	ReasoningEffort     string            `json:"reasoning_effort,omitempty"`
+	ExtraBody           map[string]any    `json:"extra_body,omitempty"`
+	// Tools/ToolChoice 保持原始 JSON 透传，不做形态拦截。
 	Tools      []json.RawMessage `json:"tools,omitempty"`
 	ToolChoice json.RawMessage   `json:"tool_choice,omitempty"`
 }
 
 type AppConfig struct {
-	ModelAlias           map[string]string `json:"model_alias"`
-	ReasoningEffortMap   map[string]string `json:"reasoning_effort_map"`
-	ForceDisableThinking bool              `json:"force_disable_thinking"`
-	Socks5Proxies        []Socks5Proxy     `json:"socks5_proxies,omitempty"`
-	ActiveSocks5         string            `json:"active_socks5,omitempty"`
+	ModelAlias         map[string]string `json:"model_alias"`
+	ReasoningEffortMap map[string]string `json:"reasoning_effort_map"`
+	Socks5Proxies      []Socks5Proxy     `json:"socks5_proxies,omitempty"`
+	ActiveSocks5       string            `json:"active_socks5,omitempty"`
 }
 
 // ======================== 配置管理 ========================
@@ -736,7 +742,6 @@ func applyConfig(cfg AppConfig) {
 	if cfg.ReasoningEffortMap != nil {
 		reasoningEffortMap = cfg.ReasoningEffortMap
 	}
-	forceDisableThinking = cfg.ForceDisableThinking
 
 	socks5Mu.Lock()
 	if cfg.Socks5Proxies != nil {
@@ -763,10 +768,10 @@ func resolveModel(model string) string {
 	return m
 }
 
-func getForceDisableThinking() bool {
+func getReasoningEffortMap() map[string]string {
 	configMu.RLock()
 	defer configMu.RUnlock()
-	return forceDisableThinking
+	return maps.Clone(reasoningEffortMap)
 }
 
 // ======================== Token 统计 ========================
@@ -822,14 +827,33 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 		"messages": req.Messages,
 		"stream":   req.Stream,
 	}
+	if req.Temperature != nil {
+		converted["temperature"] = *req.Temperature
+	}
+	if req.MaxTokens != 0 {
+		converted["max_tokens"] = req.MaxTokens
+	} else if req.MaxCompletionTokens != 0 {
+		// 客户端新字段 max_completion_tokens 映射为上游认识的 max_tokens。
+		converted["max_tokens"] = req.MaxCompletionTokens
+	}
+	if req.TopP != nil {
+		converted["top_p"] = *req.TopP
+	}
+	if req.Thinking != nil {
+		converted["thinking"] = req.Thinking
+	}
+	if req.ReasoningEffort != "" {
+		effort := req.ReasoningEffort
+		if mapped, ok := getReasoningEffortMap()[effort]; ok {
+			effort = mapped
+		}
+		converted["reasoning_effort"] = effort
+	}
 	if len(req.Tools) > 0 {
 		converted["tools"] = req.Tools
 	}
 	if req.ToolChoice != nil {
 		converted["tool_choice"] = req.ToolChoice
-	}
-	if getForceDisableThinking() {
-		converted["thinking"] = map[string]string{"type": "disabled"}
 	}
 	// 合并 ExtraBody
 	if req.ExtraBody != nil {
@@ -851,49 +875,63 @@ func buildUpstreamBody(req *OpenAIRequest) []byte {
 	return b
 }
 
-// ======================== 工具类型校验 ========================
+// ======================== 消息处理 ========================
 
-// hasNonFunctionTool 检测请求中是否存在非 function 类型的工具声明、
-// tool_calls 或 tool_choice。本代理只接受 function 工具，其余形态
-// （custom、grammar 等）一律拒绝（400），不再静默转成 function。
-func hasNonFunctionTool(req *OpenAIRequest) bool {
-	// tools 声明：只要 type 不是 function 就拒绝
-	for _, raw := range req.Tools {
-		var t struct {
-			Type string `json:"type"`
+// fixToolCallGaps 对齐工具调用历史：去掉同一 tool_call_id 的重复 tool
+// 响应，并保证 assistant 的每个 tool_calls 之后都有对应的 tool 结果，
+// 缺失时补占位消息。OpenAI 兼容上游要求 tool 消息不重复且紧跟 tool_calls。
+func fixToolCallGaps(messages []json.RawMessage) []json.RawMessage {
+	type rawMsg struct {
+		Role       string            `json:"role"`
+		ToolCallID string            `json:"tool_call_id"`
+		ToolCalls  []json.RawMessage `json:"tool_calls"`
+	}
+	toolResponses := map[string]json.RawMessage{}
+	for _, raw := range messages {
+		var m rawMsg
+		if json.Unmarshal(raw, &m) != nil {
+			continue
 		}
-		if json.Unmarshal(raw, &t) != nil || t.Type != "function" {
-			return true
+		if m.Role == "tool" && m.ToolCallID != "" {
+			toolResponses[m.ToolCallID] = raw
 		}
 	}
-	// tool_choice：对象形态时 type 必须是 function，字符串形态（auto/none/required）放行
-	if len(req.ToolChoice) > 0 && string(req.ToolChoice) != "null" {
-		var t struct {
-			Type string `json:"type"`
+	fixed := make([]json.RawMessage, 0, len(messages)+len(messages)/4)
+	emitted := map[string]bool{}
+	for _, raw := range messages {
+		var m rawMsg
+		if json.Unmarshal(raw, &m) != nil {
+			fixed = append(fixed, raw)
+			continue
 		}
-		if json.Unmarshal(req.ToolChoice, &t) == nil && t.Type != "" && t.Type != "function" {
-			return true
+		if m.Role == "tool" && m.ToolCallID != "" && emitted[m.ToolCallID] {
+			continue
 		}
-	}
-	// 消息历史中的 assistant tool_calls：type 必须是 function
-	for _, raw := range req.Messages {
-		var m struct {
-			Role      string            `json:"role"`
-			ToolCalls []json.RawMessage `json:"tool_calls"`
-		}
-		if json.Unmarshal(raw, &m) != nil || m.Role != "assistant" || len(m.ToolCalls) == 0 {
+		fixed = append(fixed, raw)
+		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
 			continue
 		}
 		for _, tcRaw := range m.ToolCalls {
 			var tc struct {
-				Type string `json:"type"`
+				ID string `json:"id"`
 			}
-			if json.Unmarshal(tcRaw, &tc) != nil || tc.Type != "function" {
-				return true
+			if json.Unmarshal(tcRaw, &tc) != nil || tc.ID == "" {
+				continue
 			}
+			if resp, ok := toolResponses[tc.ID]; ok {
+				fixed = append(fixed, resp)
+			} else {
+				placeholder, _ := json.Marshal(map[string]any{
+					"role":         "tool",
+					"tool_call_id": tc.ID,
+					"content":      "Tool call result not available",
+				})
+				fixed = append(fixed, placeholder)
+			}
+			emitted[tc.ID] = true
 		}
 	}
-	return false
+	return fixed
 }
 
 // ======================== 响应透传 ========================
@@ -1205,6 +1243,116 @@ func filterResponseHeaders(h http.Header) http.Header {
 	return filtered
 }
 
+// applyFilteredResponseHeaders 把上游的安全响应头（限流等）回传给客户端。
+// Content-Type 除外：流式/非流式的 Content-Type 都必须由本网关指定，透传
+// 上游值会把 text/event-stream 误标或漏标。白名单里保留它仅为语义完整。
+func applyFilteredResponseHeaders(w http.ResponseWriter, upHeader http.Header) {
+	for k, vs := range filterResponseHeaders(upHeader) {
+		if k == "Content-Type" {
+			continue
+		}
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+}
+
+// openAIError 是返回给 OpenAI 兼容客户端的标准错误结构。
+type openAIError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    string `json:"code,omitempty"`
+}
+
+// normalizeErrorBody 解析上游错误体为 openAIError，缺失字段补默认值，保证
+// 客户端总能从 message/type/code 稳定解析。无法解析时降级为通用错误。
+func normalizeErrorBody(body []byte, fallbackType string) openAIError {
+	err := openAIError{Message: "upstream error", Type: fallbackType}
+	if len(body) == 0 {
+		return err
+	}
+	var raw struct {
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
+		Detail  string          `json:"detail"`
+	}
+	if json.Unmarshal(body, &raw) != nil {
+		return err
+	}
+	// OpenAI 形态：{"error":{"message","type","code"}}
+	var obj struct {
+		Message any    `json:"message"`
+		Type    string `json:"type"`
+		Code    any    `json:"code"`
+	}
+	// 空对象（如 {"error":{}}）不视为 OpenAI 形态，继续走兜底
+	isOpenAIError := len(raw.Error) > 0 && string(raw.Error) != "null" && json.Unmarshal(raw.Error, &obj) == nil
+	if isOpenAIError && (obj.Message != nil || obj.Type != "" || obj.Code != nil) {
+		if m, ok := obj.Message.(string); ok && m != "" {
+			err.Message = m
+		}
+		if obj.Type != "" {
+			err.Type = obj.Type
+		}
+		switch c := obj.Code.(type) {
+		case string:
+			err.Code = c
+		case float64:
+			err.Code = strconv.FormatFloat(c, 'f', -1, 64)
+		}
+		return err
+	}
+	// 非 OpenAI 形态兜底：error 字符串 / 顶层 message / detail
+	var estr string
+	if json.Unmarshal(raw.Error, &estr) == nil && estr != "" {
+		err.Message = estr
+	} else if raw.Message != "" {
+		err.Message = raw.Message
+	} else if raw.Detail != "" {
+		err.Message = raw.Detail
+	}
+	return err
+}
+
+// writeErrorJSON 以 application/json 输出标准错误结构，保留上游状态码。
+// reqID 用于日志关联；5xx 记 Error（需人工介入），其余（429/400 等）记 Warn。
+func writeErrorJSON(w http.ResponseWriter, status int, e openAIError, reqID string) {
+	if status < 100 {
+		status = http.StatusInternalServerError
+	}
+	if status >= 500 {
+		slog.Error("upstream error response", "request_id", reqID, "status", status, "type", e.Type, "code", e.Code, "message", e.Message)
+	} else {
+		slog.Warn("upstream error response", "request_id", reqID, "status", status, "type", e.Type, "code", e.Code, "message", e.Message)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{"error": e})
+}
+
+// sendStreamError 在已经建立 SSE 流的中途发生错误时，补一个
+// finish_reason=error 的失败终态 chunk 再发 [DONE]，让客户端识别为
+// "本次生成失败"而不是被异常断开或误判为正常结束。
+func sendStreamError(w http.ResponseWriter, model string, e openAIError) {
+	chunk, _ := json.Marshal(map[string]any{
+		"id":      "chatcmpl_error",
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []map[string]any{{
+			"index":         0,
+			"delta":         map[string]any{},
+			"finish_reason": "error",
+		}},
+		"error": e,
+	})
+	fmt.Fprintf(w, "data: %s\n\n", chunk)
+	w.Write([]byte("data: [DONE]\n\n"))
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // ======================== Chat Completions Handler ========================
 
 func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
@@ -1221,7 +1369,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cnt := requestCount.Add(1)
-	slog.Debug("chat completion request body", "count", cnt, "body", string(body))
+	reqID := getReqID(r.Context())
+	slog.Debug("chat completion request body", "request_id", reqID, "count", cnt, "body", string(body))
 
 	var req OpenAIRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -1238,43 +1387,29 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 多模态路由：检测到图片时转发到配置的上游
-
+	req.Messages = fixToolCallGaps(req.Messages)
 	if req.Stream {
 		if req.ExtraBody == nil {
 			req.ExtraBody = map[string]any{}
 		}
 		req.ExtraBody["stream_options"] = map[string]any{"include_usage": true}
 	}
-	// 只接受 function 工具，其余形态一律拒绝
-	if hasNonFunctionTool(&req) {
-		slog.Info("rejected non-function tool", "model", req.Model, "stream", req.Stream)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
-			"message": "only function tools are supported; custom and other tool types are not accepted",
-			"type":    "invalid_request_error",
-		}})
-		return
-	}
 	upstreamBody := buildUpstreamBody(&req)
 
 	if req.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, req.Model, auth)
+		upResp, status, upHeader, err := callOpenCodeAPIStream(upstreamBody, req.Model, auth)
 		if err != nil || status < 200 || status >= 300 {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(status)
+			applyFilteredResponseHeaders(w, upHeader)
+			var errBody []byte
 			if upResp != nil {
-				errBody, _ := io.ReadAll(upResp)
-				if len(errBody) > 0 {
-					w.Write(errBody)
-					return
-				}
+				errBody, _ = io.ReadAll(upResp)
+				upResp.Close()
 			}
-			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error", "type": "upstream_error"}})
+			writeErrorJSON(w, status, normalizeErrorBody(errBody, "upstream_error"), reqID)
 			return
 		}
 		defer upResp.Close()
+		applyFilteredResponseHeaders(w, upHeader)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -1287,12 +1422,12 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				if err == io.EOF {
 					break
 				}
-				slog.Error("stream read error", "error", err)
-				// 发送错误事件通知客户端
-				w.Write([]byte("data: {\"error\":\"stream read error\"}\n\n"))
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
-				}
+				slog.Error("stream read error", "request_id", reqID, "error", err, "model", req.Model)
+				sendStreamError(w, req.Model, openAIError{
+					Message: "stream read error",
+					Type:    "stream_error",
+					Code:    "stream_error",
+				})
 				return
 			}
 			if doneSeen {
@@ -1326,17 +1461,13 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, req.Model, auth)
+	respBody, status, upHeader, err := callOpenCodeAPI(upstreamBody, req.Model, auth)
 	if err != nil || status < 200 || status >= 300 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		if len(respBody) > 0 {
-			w.Write(respBody)
-		} else {
-			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error", "type": "upstream_error"}})
-		}
+		applyFilteredResponseHeaders(w, upHeader)
+		writeErrorJSON(w, status, normalizeErrorBody(respBody, "upstream_error"), reqID)
 		return
 	}
+	applyFilteredResponseHeaders(w, upHeader)
 	outBody := respBody
 	// Record token usage
 	var usageResp map[string]any
@@ -1483,7 +1614,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		configMu.RLock()
-		cfg := AppConfig{ModelAlias: modelAlias, ReasoningEffortMap: reasoningEffortMap, ForceDisableThinking: forceDisableThinking}
+		cfg := AppConfig{ModelAlias: modelAlias, ReasoningEffortMap: reasoningEffortMap}
 		configMu.RUnlock()
 		socks5Mu.RLock()
 		cfg.Socks5Proxies = socks5Proxies
@@ -1503,7 +1634,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		applyConfig(cfg)
 		if debugMode {
-			slog.Info("config updated", "aliases", len(cfg.ModelAlias), "effort_map", len(cfg.ReasoningEffortMap), "force_disable", cfg.ForceDisableThinking)
+			slog.Info("config updated", "aliases", len(cfg.ModelAlias), "effort_map", len(cfg.ReasoningEffortMap))
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -1733,11 +1864,6 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 #toast.error{background:rgba(240,96,96,.85)}
 #toast.show{opacity:1;transform:translateY(0)}
 .empty-hint{color:var(--text-ter);font-size:13px;padding:28px;text-align:center}
-.think-row{display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:12px;transition:border-color .15s}
-.think-row:hover{border-color:var(--border-light)}
-.think-row input[type="checkbox"]{width:16px;height:16px;accent-color:var(--accent);cursor:pointer}
-.think-row label{font-size:13px;font-weight:500;cursor:pointer;margin:0;color:var(--text)}
-.think-row .hint{font-size:11px;color:var(--text-ter);margin:0 0 0 auto;white-space:nowrap}
 @media(max-width:700px){.config-grid{grid-template-columns:1fr}.container{padding:16px 12px}header{flex-direction:column;align-items:flex-start;gap:8px}}
 .theme-toggle{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 12px;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;transition:all .15s;color:var(--text-sec);flex-shrink:0;line-height:1}
 .theme-toggle:hover{border-color:var(--border-light);color:var(--text)}
@@ -1781,11 +1907,6 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 <thead><tr><th style="width:35%">请求值</th><th style="width:42%">映射值</th><th style="width:23%"></th></tr></thead>
 <tbody></tbody>
 </table>
-</div>
-<div class="think-row">
-<input type="checkbox" id="force_disable_thinking">
-<label for="force_disable_thinking">强制禁用思考模式</label>
-<span class="hint">移除所有推理内容</span>
 </div>
 <div class="actions">
 <button class="btn btn-primary" onclick="addEffortRow()">添加映射</button>
@@ -1834,7 +1955,7 @@ let aliasData={},effortData={},modelList=[],socks5Data=[];
 function toggleTheme(){const d=document.documentElement;const cur=d.getAttribute('data-theme');const next=cur==='dark'?null:'dark';if(next)d.setAttribute('data-theme',next);else d.removeAttribute('data-theme');localStorage.setItem('theme',next||'light');document.querySelector('.theme-toggle').textContent=next==='dark'?'🌙':'☀'}
 (function(){const t=localStorage.getItem('theme');if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');document.addEventListener('DOMContentLoaded',()=>{const b=document.querySelector('.theme-toggle');if(b)b.textContent='🌙'})}})();
 function reloadConfig(){const sy=window.scrollY;fetch('/api/reload',{method:'POST'}).then(r=>r.json()).then(d=>{showToast('会话已刷新，模型 '+d.models+' 个','success')}).catch(()=>{}).finally(()=>{loadConfig();loadStats();setTimeout(()=>window.scrollTo(0,sy),100)})}
-async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];const mr=await fetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id).sort();renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||'';setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
+async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];const mr=await fetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id).sort();renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||'';setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
 function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无别名配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+modelSelectHtml(aliasData[k])+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>').join('')}
 function modelSelectHtml(selected){let h='<select data-field="val" class="m-select">';h+='<option value="">-- 选择模型 --</option>';for(const m of modelList){h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}h+='</select>';return h}
 function addAliasRow(){const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td>'+modelSelectHtml('')+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>')}
@@ -1849,7 +1970,7 @@ function addSocks5Row(){const tb=document.querySelector('#socks5Table tbody');if
 function delSocks5(i){socks5Data.splice(i,1);renderSocks5Table()}
 function collectSocks5(){const r=[];document.querySelectorAll('#socks5Table tbody tr').forEach(tr=>{const a=tr.querySelector('[data-field="addr"]');if(a&&a.value.trim())r.push({addr:a.value.trim(),name:(tr.querySelector('[data-field="name"]')||{}).value?.trim()||'',username:(tr.querySelector('[data-field="username"]')||{}).value?.trim()||'',password:(tr.querySelector('[data-field="password"]')||{}).value?.trim()||''})});socks5Data=r;return r}
 function renderSocks5Select(){const sel=document.getElementById('activeSocks5');const cur=sel.value;sel.innerHTML='<option value="">直连（不使用代理）</option>';socks5Data.forEach(p=>{if(p.addr){const label=p.name?p.name+' ('+p.addr+')':p.addr;const opt=document.createElement('option');opt.value=p.addr;opt.textContent=label;sel.appendChild(opt)}});if(socks5Data.length>=2){const opt=document.createElement('option');opt.value='__round_robin__';opt.textContent='轮询（自动切换）';sel.appendChild(opt)}sel.value=cur;if(!sel.value)sel.value='';}
-async function saveConfig(){collectAliases();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,force_disable_thinking:document.getElementById('force_disable_thinking').checked,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
+async function saveConfig(){collectAliases();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function showToast(msg,t){const e=document.getElementById('toast');e.textContent=msg;e.className=t+' show';clearTimeout(e._tid);e._tid=setTimeout(()=>e.classList.remove('show'),2500)}
 async function resetStats(){if(!confirm('确认清空所有 Token 统计？\n此操作不可撤销。'))return;const s=document.getElementById('resetStatus');s.textContent='清空中...';try{const r=await fetch('/api/stats',{method:'DELETE'});if(!r.ok)throw new Error(await r.text());document.getElementById('statsContent').innerHTML='<div class="empty-hint">暂无数据</div>';s.textContent='已清空';setTimeout(()=>s.textContent='',2000)}catch(e){s.textContent='失败: '+e.message}}

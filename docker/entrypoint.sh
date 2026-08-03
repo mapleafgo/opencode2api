@@ -21,7 +21,6 @@ if [ ! -f "$OPENCODE2API_CONFIG" ]; then
     "medium": "medium",
     "high": "high"
   },
-  "force_disable_thinking": false,
   "socks5_proxies": [
     {
       "name": "$proxy_name",

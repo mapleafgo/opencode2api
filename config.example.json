@@ -7,7 +7,6 @@
     "medium": "medium",
     "high": "high"
   },
-  "force_disable_thinking": false,
   "socks5_proxies": [
     {
       "name": "local",
