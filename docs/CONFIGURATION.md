@@ -6,33 +6,9 @@
 cp config.example.json config.json
 ```
 
+本项目只保留 SOCKS5 配置。Chat Completions 请求做 API 流级透传，不做任何请求体改写。
+
 ## 字段
-
-### `model_alias`
-
-模型别名映射。键是客户端请求的模型名，值是实际传给上游的模型名。
-
-```json
-{
-  "model_alias": {
-    "gpt-4o-mini": "deepseek-v4-flash-free"
-  }
-}
-```
-
-### `reasoning_effort_map`
-
-请求中的 `reasoning_effort` 按此映射转换后传给上游；未配置的档位原样透传。
-
-```json
-{
-  "reasoning_effort_map": {
-    "minimal": "low",
-    "medium": "medium",
-    "high": "high"
-  }
-}
-```
 
 ### `socks5_proxies`
 
@@ -61,7 +37,7 @@ SOCKS5 代理列表。
 
 ## 管理面板
 
-打开 `http://127.0.0.1:8000/` 可进入管理面板。面板可以修改配置、刷新模型和查看 token 统计。
+打开 `http://127.0.0.1:8000/` 可进入管理面板。面板用于配置和刷新 SOCKS5 代理、刷新 OpenCode 会话。
 
 默认管理密码是 `123456`，生产部署必须修改：
 

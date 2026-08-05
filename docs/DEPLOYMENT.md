@@ -95,4 +95,4 @@ sudo systemctl status opencode2api
 - 使用 HTTPS
 - 在反向代理层加限流和访问控制
 - 修改默认管理密码
-- 定期备份 `config.json`，按需保留或清理 `stats.json`
+- 定期备份 `config.json`

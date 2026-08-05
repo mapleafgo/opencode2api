@@ -1,16 +1,16 @@
 # opencode2api
 
-`opencode2api` 是一个本地 HTTP 代理，把 OpenAI Chat Completions 风格的请求转发到 OpenCode 上游接口，并提供模型别名、reasoning/thinking 兼容、SOCKS5 代理和一个轻量管理面板。
+`opencode2api` 是一个本地 HTTP 代理，把 OpenAI Chat Completions 风格的请求做 API 流级透传转发到 OpenCode 上游接口，只做目录路由、会话头注入与 SOCKS5 代理，不改写任何请求体或响应流。
 
 > 这个项目不是 OpenAI、Anthropic 或 OpenCode 的官方项目。请遵守上游服务条款，并只在你有权限的环境中使用。
 
 ## 功能
 
 - OpenAI 兼容接口：`/v1/chat/completions`、`/v1/models`
-- 流式 SSE 透传和 token 用量统计
-- 模型别名、reasoning effort 映射、强制禁用 thinking
+- Chat Completions API 流级透传：请求体与 SSE 响应原样转发，无任何改写
+- OpenCode 会话头注入与 Zen/Go/public 三层目录路由
 - SOCKS5 直连、指定代理和轮询代理
-- Web 管理面板：配置、统计、刷新上游会话
+- Web 管理面板：SOCKS5 配置、刷新上游会话
 - GitHub Actions 自动构建 Linux、macOS、Windows、FreeBSD 多平台 release
 - GitHub Actions 自动发布 Docker 镜像到 GHCR
 
@@ -49,11 +49,13 @@ Chat Completions 示例：
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4o-mini",
+    "model": "deepseek-v4-flash-free",
     "messages": [{"role": "user", "content": "hello"}],
     "stream": false
   }'
 ```
+
+请求体会原样透传给上游，不做模型别名解析或字段改写。
 
 Go 订阅示例：
 

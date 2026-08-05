@@ -35,33 +35,26 @@ type fakeUpstreamResponse struct {
 	header http.Header
 }
 
-type fakeRetryTransport struct {
-	t               *testing.T
-	responses       []fakeUpstreamResponse
-	requestedModels []string
-	requestedURLs   []string
-	requestPayloads []map[string]any
-	closeIdleCalls  int
+// fakeTransport 记录转发出去的原始请求和请求头，返回预设响应。
+type fakeTransport struct {
+	t         *testing.T
+	responses []fakeUpstreamResponse
+	requests  []*http.Request
+	rawBodies []string
 }
 
-func (f *fakeRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if len(f.responses) == 0 {
-		f.t.Fatalf("unexpected request to %s", req.URL.String())
-	}
+func (f *fakeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	f.requests = append(f.requests, req)
 
-	body, err := io.ReadAll(req.Body)
+	raw, err := io.ReadAll(req.Body)
 	if err != nil {
 		f.t.Fatalf("read request body: %v", err)
 	}
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		f.t.Fatalf("unmarshal request body: %v", err)
-	}
-	model, _ := payload["model"].(string)
-	f.requestedModels = append(f.requestedModels, model)
-	f.requestedURLs = append(f.requestedURLs, req.URL.String())
-	f.requestPayloads = append(f.requestPayloads, payload)
+	f.rawBodies = append(f.rawBodies, string(raw))
 
+	if len(f.responses) == 0 {
+		f.t.Fatalf("unexpected request to %s", req.URL.String())
+	}
 	next := f.responses[0]
 	f.responses = f.responses[1:]
 	header := next.header
@@ -76,16 +69,13 @@ func (f *fakeRetryTransport) RoundTrip(req *http.Request) (*http.Response, error
 	}, nil
 }
 
-func (f *fakeRetryTransport) CloseIdleConnections() {
-	f.closeIdleCalls++
-}
-
-func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *fakeRetryTransport {
+func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *fakeTransport {
 	t.Helper()
 
 	oldHTTPClient := httpClient
 	oldModelsCache := modelsCache
 	oldGoModelsCache := goModelsCache
+	oldModelsLoaded := modelsLoaded
 	oldOCClientVer := ocClientVer
 	oldOCSessionID := ocSessionID
 	oldOCProjectID := ocProjectID
@@ -93,15 +83,16 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 	oldSocks5Client := socks5Client
 	oldSocks5ClientAddr := socks5ClientAddr
 
-	transport := &fakeRetryTransport{
+	transport := &fakeTransport{
 		t:         t,
 		responses: append([]fakeUpstreamResponse(nil), responses...),
 	}
 	httpClient = &http.Client{Transport: transport}
 
 	modelMu.Lock()
-	modelsCache = []ModelInfo{{ID: "fallback-model-free"}}
-	goModelsCache = nil
+	modelsCache = []ModelInfo{{ID: "deepseek-v4-flash-free"}}
+	goModelsCache = []ModelInfo{{ID: "glm-5.2"}}
+	modelsLoaded = true
 	modelMu.Unlock()
 
 	socks5Mu.Lock()
@@ -121,6 +112,7 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 		modelMu.Lock()
 		modelsCache = oldModelsCache
 		goModelsCache = oldGoModelsCache
+		modelsLoaded = oldModelsLoaded
 		modelMu.Unlock()
 		socks5Mu.Lock()
 		activeSocks5 = oldActiveSocks5
@@ -136,502 +128,99 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 	return transport
 }
 
-func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
-	tests := []struct {
-		name        string
-		stream      bool
-		responses   []fakeUpstreamResponse
-		wantStatus  int
-		wantBody    string
-		wantModels  []string
-		wantCloses  int
-		requestBody string
-	}{
-		{
-			name:   "non-stream retries 401",
-			stream: false,
-			responses: []fakeUpstreamResponse{
-				{status: http.StatusUnauthorized, body: `{"error":"unauthorized"}`},
-				{status: http.StatusOK, body: `{"id":"chatcmpl_test","choices":[]}`},
-			},
-			wantStatus:  http.StatusOK,
-			wantBody:    `{"id":"chatcmpl_test","choices":[]}`,
-			wantModels:  []string{"primary-model", "fallback-model-free"},
-			wantCloses:  1,
-			requestBody: `{"model":"primary-model","messages":[]}`,
-		},
-		{
-			name:   "stream retries 429",
-			stream: true,
-			responses: []fakeUpstreamResponse{
-				{status: http.StatusTooManyRequests, body: `{"error":"rate_limited"}`},
-				{status: http.StatusOK, body: "data: ok\n\n"},
-			},
-			wantStatus:  http.StatusOK,
-			wantBody:    "data: ok\n\n",
-			wantModels:  []string{"primary-model", "fallback-model-free"},
-			wantCloses:  1,
-			requestBody: `{"model":"primary-model","messages":[],"stream":true}`,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			transport := installFakeOpenCodeClient(t, tt.responses)
-
-			var (
-				body   []byte
-				status int
-				err    error
-			)
-			if tt.stream {
-				var respBody io.ReadCloser
-				respBody, status, _, err = callOpenCodeAPIStream([]byte(tt.requestBody), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
-				if respBody != nil {
-					defer respBody.Close()
-				}
-				if err == nil {
-					body, err = io.ReadAll(respBody)
-				}
-			} else {
-				body, status, _, err = callOpenCodeAPI([]byte(tt.requestBody), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
-			}
-			if err != nil {
-				t.Fatalf("upstream call error = %v", err)
-			}
-			if status != tt.wantStatus {
-				t.Fatalf("upstream call status = %d, want %d", status, tt.wantStatus)
-			}
-			if string(body) != tt.wantBody {
-				t.Fatalf("upstream call body = %q, want %q", string(body), tt.wantBody)
-			}
-			if !reflect.DeepEqual(transport.requestedModels, tt.wantModels) {
-				t.Fatalf("requested models = %#v, want %#v", transport.requestedModels, tt.wantModels)
-			}
-			if transport.closeIdleCalls != tt.wantCloses {
-				t.Fatalf("CloseIdleConnections calls = %d, want %d", transport.closeIdleCalls, tt.wantCloses)
-			}
-		})
-	}
-}
-
-func TestCallOpenCodeAPIFallbackKeepsOriginalGoEndpoint(t *testing.T) {
-	tests := []struct {
-		name   string
-		stream bool
-	}{
-		{name: "non-stream", stream: false},
-		{name: "stream", stream: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
-				{status: http.StatusUnauthorized, body: `{"error":"unauthorized"}`},
-				{status: http.StatusOK, body: `{"id":"chatcmpl_test","choices":[]}`},
-			})
-			modelMu.Lock()
-			modelsCache = []ModelInfo{{ID: "shared-model"}}
-			goModelsCache = []ModelInfo{{ID: "go-only-model"}, {ID: "shared-model"}}
-			modelMu.Unlock()
-
-			auth := UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-validkey0123456789abcdef"}
-			body := []byte(`{"model":"go-only-model","messages":[]}`)
-			if tt.stream {
-				body = []byte(`{"model":"go-only-model","messages":[],"stream":true}`)
-				respBody, status, _, err := callOpenCodeAPIStream(body, "go-only-model", auth)
-				if respBody != nil {
-					defer respBody.Close()
-				}
-				if err != nil {
-					t.Fatalf("callOpenCodeAPIStream() error = %v", err)
-				}
-				if status != http.StatusOK {
-					t.Fatalf("callOpenCodeAPIStream() status = %d, want %d", status, http.StatusOK)
-				}
-			} else {
-				_, status, _, err := callOpenCodeAPI(body, "go-only-model", auth)
-				if err != nil {
-					t.Fatalf("callOpenCodeAPI() error = %v", err)
-				}
-				if status != http.StatusOK {
-					t.Fatalf("callOpenCodeAPI() status = %d, want %d", status, http.StatusOK)
-				}
-			}
-
-			wantURL := "https://opencode.ai/zen/go/v1/chat/completions"
-			if !reflect.DeepEqual(transport.requestedURLs, []string{wantURL, wantURL}) {
-				t.Fatalf("requested URLs = %#v, want both requests to %q", transport.requestedURLs, wantURL)
-			}
-		})
-	}
-}
-
-func TestCallOpenCodeAPIExhausted4xxReturnsLastUpstreamResponse(t *testing.T) {
-	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
-		{
-			status: http.StatusUnauthorized,
-			body:   `{"error":"unauthorized"}`,
-			header: http.Header{"X-Upstream-Error": []string{"first"}},
-		},
-		{
-			status: http.StatusForbidden,
-			body:   `{"error":"forbidden"}`,
-			header: http.Header{"X-Upstream-Error": []string{"last"}},
-		},
-	})
-
-	body, status, header, err := callOpenCodeAPI([]byte(`{"model":"primary-model","messages":[]}`), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
-	if err == nil {
-		t.Fatal("callOpenCodeAPI() error = nil, want upstream error")
-	}
-	if status != http.StatusForbidden {
-		t.Fatalf("callOpenCodeAPI() status = %d, want %d", status, http.StatusForbidden)
-	}
-	if string(body) != `{"error":"forbidden"}` {
-		t.Fatalf("callOpenCodeAPI() body = %s, want final upstream body", string(body))
-	}
-	if header.Get("X-Upstream-Error") != "last" {
-		t.Fatalf("final header = %q, want last", header.Get("X-Upstream-Error"))
-	}
-	wantModels := []string{"primary-model", "fallback-model-free"}
-	if !reflect.DeepEqual(transport.requestedModels, wantModels) {
-		t.Fatalf("requested models = %#v, want %#v", transport.requestedModels, wantModels)
-	}
-	if transport.closeIdleCalls != 1 {
-		t.Fatalf("CloseIdleConnections calls = %d, want 1", transport.closeIdleCalls)
-	}
-}
-
-func TestFunctionToolsAccepted(t *testing.T) {
+// TestChatCompletionsRawPassthrough 验证请求体和响应体均原样透传、不做任何改写。
+func TestChatCompletionsRawPassthrough(t *testing.T) {
 	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
 		{status: http.StatusOK, body: `{"id":"chatcmpl_test","choices":[]}`},
 	})
 
-	// 纯 function 工具应该正常通过，不被拒绝
-	body := `{
-		"model":"primary-model",
-		"messages":[
-			{"role":"user","content":"x"},
-			{"role":"assistant","tool_calls":[{"id":"call_f","type":"function","function":{"name":"f","arguments":"{\"q\":1}"}}]},
-			{"role":"tool","tool_call_id":"call_f","content":"ok"}
-		],
-		"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
-		"tool_choice":"auto"
-	}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-	rec := httptest.NewRecorder()
-	chatCompletionsHandler(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
-	}
-	if len(transport.requestPayloads) != 1 {
-		t.Fatalf("upstream requests = %d, want 1", len(transport.requestPayloads))
-	}
-}
-
-func TestChatForwardsTopLevelParamsAndThinking(t *testing.T) {
-	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
-		{status: http.StatusOK, body: `{"id":"chatcmpl_test","choices":[]}`},
-	})
-
-	body := `{
+	clientBody := `{
 		"model":"primary-model",
 		"messages":[{"role":"user","content":"x"}],
-		"temperature":0.7,
-		"max_tokens":512,
-		"top_p":0.9,
-		"thinking":{"type":"enabled"},
-		"reasoning_effort":"high"
+		"max_completion_tokens":2048,
+		"reasoning_effort":"high",
+		"thinking":{"type":"enabled"}
 	}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(clientBody))
+	req.Header.Set("Authorization", "Bearer sk-validkey0123456789abcdef")
 	rec := httptest.NewRecorder()
+
 	chatCompletionsHandler(rec, req)
+
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
-
-	up := transport.requestPayloads[0]
-	if got, ok := up["temperature"].(float64); !ok || got != 0.7 {
-		t.Fatalf("temperature = %#v, want 0.7", up["temperature"])
+	if rec.Body.String() != `{"id":"chatcmpl_test","choices":[]}` {
+		t.Fatalf("response body = %q, want upstream passthrough", rec.Body.String())
 	}
-	if got, ok := up["max_tokens"].(float64); !ok || got != 512 {
-		t.Fatalf("max_tokens = %#v, want 512", up["max_tokens"])
+	if len(transport.rawBodies) != 1 {
+		t.Fatalf("forwarded requests = %d, want 1", len(transport.rawBodies))
 	}
-	if got, ok := up["top_p"].(float64); !ok || got != 0.9 {
-		t.Fatalf("top_p = %#v, want 0.9", up["top_p"])
+	// 请求体必须与客户端原始字节完全一致，不做字段重写。
+	if transport.rawBodies[0] != clientBody {
+		t.Fatalf("forwarded body = %q, want identical client body %q", transport.rawBodies[0], clientBody)
 	}
-	if got, ok := up["thinking"].(map[string]any); !ok || got["type"] != "enabled" {
-		t.Fatalf("thinking = %#v, want enabled passthrough", up["thinking"])
-	}
-	if got, ok := up["reasoning_effort"].(string); !ok || got != "high" {
-		t.Fatalf("reasoning_effort = %#v, want high", up["reasoning_effort"])
+	if got := transport.requests[0].Header.Get("Authorization"); got != "Bearer sk-validkey0123456789abcdef" {
+		t.Fatalf("Authorization = %q, want passthrough of client key", got)
 	}
 }
 
-func TestChatReasoningEffortMapped(t *testing.T) {
+// TestChatCompletionsStreamPassthrough 验证 SSE 流原样透传、不做 [DONE]/usage 处理。
+func TestChatCompletionsStreamPassthrough(t *testing.T) {
+	upstreamSSE := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"usage\":{\"total_tokens\":9}}\n\ndata: [DONE]\n\n"
 	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
-		{status: http.StatusOK, body: `{"id":"chatcmpl_1","choices":[]}`},
-		{status: http.StatusOK, body: `{"id":"chatcmpl_2","choices":[]}`},
+		{
+			status: http.StatusOK,
+			header: http.Header{"Content-Type": []string{"text/event-stream"}},
+			body:   upstreamSSE,
+		},
 	})
 
-	configMu.Lock()
-	old := reasoningEffortMap
-	reasoningEffortMap = map[string]string{"high": "max"}
-	configMu.Unlock()
-	t.Cleanup(func() {
-		configMu.Lock()
-		reasoningEffortMap = old
-		configMu.Unlock()
-	})
-
-	// 配置了映射的档位按映射值传给上游
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-		strings.NewReader(`{
-			"model":"primary-model",
-			"messages":[{"role":"user","content":"x"}],
-			"reasoning_effort":"high"
-		}`))
+		strings.NewReader(`{"model":"primary-model","messages":[{"role":"user","content":"hi"}],"stream":true}`))
 	rec := httptest.NewRecorder()
-	chatCompletionsHandler(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
-	}
-	if got, ok := transport.requestPayloads[0]["reasoning_effort"].(string); !ok || got != "max" {
-		t.Fatalf("mapped reasoning_effort = %#v, want max", transport.requestPayloads[0]["reasoning_effort"])
-	}
 
-	// 未配置的档位原样透传
-	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-		strings.NewReader(`{
-			"model":"primary-model",
-			"messages":[{"role":"user","content":"x"}],
-			"reasoning_effort":"low"
-		}`))
-	rec = httptest.NewRecorder()
 	chatCompletionsHandler(rec, req)
+
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
-	if got, ok := transport.requestPayloads[1]["reasoning_effort"].(string); !ok || got != "low" {
-		t.Fatalf("passthrough reasoning_effort = %#v, want low", transport.requestPayloads[1]["reasoning_effort"])
+	if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream passthrough", got)
+	}
+	if rec.Body.String() != upstreamSSE {
+		t.Fatalf("streamed body = %q, want verbatim passthrough", rec.Body.String())
+	}
+	if len(transport.rawBodies) != 1 {
+		t.Fatalf("forwarded requests = %d, want 1", len(transport.rawBodies))
 	}
 }
 
-func TestChatMapsMaxCompletionTokensToMaxTokens(t *testing.T) {
+// TestChatForwardsUpstreamErrorRaw 验证上游错误状态与响应体原样透传、不标准化。
+func TestChatForwardsUpstreamErrorRaw(t *testing.T) {
 	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
-		{status: http.StatusOK, body: `{"id":"chatcmpl_test","choices":[]}`},
-	})
-
-	// 仅发新字段 max_completion_tokens，上游应收到 max_tokens
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-		strings.NewReader(`{
-			"model":"primary-model",
-			"messages":[{"role":"user","content":"x"}],
-			"max_completion_tokens":2048
-		}`))
-	rec := httptest.NewRecorder()
-	chatCompletionsHandler(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
-	}
-	up := transport.requestPayloads[0]
-	if got, ok := up["max_tokens"].(float64); !ok || got != 2048 {
-		t.Fatalf("max_tokens = %#v, want 2048", up["max_tokens"])
-	}
-	if _, ok := up["max_completion_tokens"]; ok {
-		t.Fatalf("max_completion_tokens should not reach upstream, got %#v", up["max_completion_tokens"])
-	}
-}
-
-func TestNormalizeErrorBody(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-		msg  string
-		typ  string
-		code string
-	}{
-		{
-			name: "full upstream error",
-			body: `{"error":{"message":"ctx too small","type":"invalid_request_error","code":"context_length_exceeded"}}`,
-			msg:  "ctx too small", typ: "invalid_request_error", code: "context_length_exceeded",
-		},
-		{
-			name: "missing code",
-			body: `{"error":{"message":"boom","type":"server_error"}}`,
-			msg:  "boom", typ: "server_error", code: "",
-		},
-		{
-			name: "numeric code normalized to string",
-			body: `{"error":{"message":"rate limited","type":"rate_limit_error","code":429}}`,
-			msg:  "rate limited", typ: "rate_limit_error", code: "429",
-		},
-		{
-			name: "garbage body falls back",
-			body: `not json`,
-			msg:  "upstream error", typ: "upstream_error", code: "",
-		},
-		{
-			name: "detail fallback",
-			body: `{"detail":"Rate limit exceeded"}`,
-			msg:  "Rate limit exceeded", typ: "upstream_error", code: "",
-		},
-		{
-			name: "error string fallback",
-			body: `{"error":"rate limited"}`,
-			msg:  "rate limited", typ: "upstream_error", code: "",
-		},
-		{
-			name: "top-level message fallback",
-			body: `{"message":"boom"}`,
-			msg:  "boom", typ: "upstream_error", code: "",
-		},
-		{
-			name: "null error ignores openai branch",
-			body: `{"error":null,"message":"boom"}`,
-			msg:  "boom", typ: "upstream_error", code: "",
-		},
-		{
-			name: "empty error object falls back",
-			body: `{"error":{},"message":"boom"}`,
-			msg:  "boom", typ: "upstream_error", code: "",
-		},
-		{
-			name: "empty body falls back",
-			body: ``,
-			msg:  "upstream error", typ: "upstream_error", code: "",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := normalizeErrorBody([]byte(tt.body), "upstream_error")
-			if got.Message != tt.msg || got.Type != tt.typ || got.Code != tt.code {
-				t.Fatalf("normalizeErrorBody() = %+v, want message=%q type=%q code=%q", got, tt.msg, tt.typ, tt.code)
-			}
-		})
-	}
-}
-
-func TestChatNonStreamErrorStandardized(t *testing.T) {
-	installFakeOpenCodeClient(t, []fakeUpstreamResponse{
 		{status: http.StatusBadRequest, body: `{"error":{"message":"ctx too small","type":"invalid_request_error","code":"context_length_exceeded"}}`},
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"primary-model","messages":[{"role":"user","content":"x"}]}`))
 	rec := httptest.NewRecorder()
+
 	chatCompletionsHandler(rec, req)
+
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
 	}
-	var out struct {
-		Error struct {
-			Message string `json:"message"`
-			Type    string `json:"type"`
-			Code    string `json:"code"`
-		} `json:"error"`
+	if rec.Body.String() != `{"error":{"message":"ctx too small","type":"invalid_request_error","code":"context_length_exceeded"}}` {
+		t.Fatalf("response body = %q, want upstream error passthrough", rec.Body.String())
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-		t.Fatalf("unmarshal error body: %v", err)
-	}
-	if out.Error.Message != "ctx too small" || out.Error.Type != "invalid_request_error" || out.Error.Code != "context_length_exceeded" {
-		t.Fatalf("standardized error = %+v", out.Error)
+	if len(transport.requests) != 1 {
+		t.Fatalf("upstream requests = %d, want 1 (no retry/fallback)", len(transport.requests))
 	}
 }
 
-func TestSendStreamErrorWritesFailureTerminal(t *testing.T) {
-	rec := httptest.NewRecorder()
-	sendStreamError(rec, "m", openAIError{
-		Message: "stream read error",
-		Type:    "stream_error",
-		Code:    "context_length_exceeded",
-	})
-	body := rec.Body.String()
-	if !strings.Contains(body, `"finish_reason":"error"`) {
-		t.Fatalf("missing finish_reason=error terminal: %s", body)
-	}
-	if !strings.Contains(body, `"code":"context_length_exceeded"`) {
-		t.Fatalf("missing error code: %s", body)
-	}
-	if !strings.Contains(body, "data: [DONE]") {
-		t.Fatalf("missing [DONE] sentinel: %s", body)
-	}
-}
-
-func TestFixToolCallGapsReordersAndDedupes(t *testing.T) {
-	mixed := []json.RawMessage{
-		json.RawMessage(`{"role":"user","content":"x"}`),
-		json.RawMessage(`{"role":"assistant","tool_calls":[{"id":"a"},{"id":"b"}]}`),
-		json.RawMessage(`{"role":"tool","tool_call_id":"a","content":"A"}`),
-		json.RawMessage(`{"role":"tool","tool_call_id":"a","content":"A-dup"}`),
-	}
-
-	got := fixToolCallGaps(mixed)
-	// 期望：user、assistant、tool a（去重取最后一条）、tool b（缺失补占位）
-	wantIDs := []string{"a", "b"}
-	var roles []string
-	var ids []string
-	for _, raw := range got {
-		var m struct {
-			Role       string `json:"role"`
-			ToolCallID string `json:"tool_call_id"`
-			Content    string `json:"content"`
-		}
-		_ = json.Unmarshal(raw, &m)
-		roles = append(roles, m.Role)
-		if m.Role == "tool" {
-			ids = append(ids, m.ToolCallID)
-			if m.Content == "" {
-				t.Fatalf("tool %s content empty; raw=%s", m.ToolCallID, raw)
-			}
-		}
-	}
-	if wantRoles := []string{"user", "assistant", "tool", "tool"}; !reflect.DeepEqual(roles, wantRoles) {
-		t.Fatalf("roles = %v, want %v", roles, wantRoles)
-	}
-	if !reflect.DeepEqual(ids, wantIDs) {
-		t.Fatalf("tool ids = %v, want %v", ids, wantIDs)
-	}
-}
-
-func TestStreamResponseKeepsReasoningContent(t *testing.T) {
-	installFakeOpenCodeClient(t, []fakeUpstreamResponse{
-		{status: http.StatusOK, body: "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"think\",\"content\":\"\"}}]}\n\ndata: [DONE]\n\n"},
-	})
-
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"primary-model","messages":[{"role":"user","content":"hi"}],"stream":true}`))
-	rec := httptest.NewRecorder()
-
-	chatCompletionsHandler(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("chatCompletionsHandler() status = %d, want %d", rec.Code, http.StatusOK)
-	}
-	if !strings.Contains(rec.Body.String(), `"reasoning_content":"think"`) {
-		t.Fatalf("streamed body = %s, want reasoning_content passthrough", rec.Body.String())
-	}
-}
-
-func TestBuildOCRequestRoutesSharedAndGoOnlyModelsByAuthMode(t *testing.T) {
-	oldModelsCache := modelsCache
-	oldGoModelsCache := goModelsCache
-	modelMu.Lock()
-	modelsCache = []ModelInfo{
-		{ID: "glm-5.2"},
-		{ID: "gpt-5.5"},
-	}
-	goModelsCache = []ModelInfo{
-		{ID: "glm-5.2"},
-		{ID: "kimi-k2.7-code"},
-	}
-	modelMu.Unlock()
-	t.Cleanup(func() {
-		modelMu.Lock()
-		modelsCache = oldModelsCache
-		goModelsCache = oldGoModelsCache
-		modelMu.Unlock()
-	})
-
+// TestForwardUpstreamRoutesByAuthAndModel 验证目录路由只取决于认证模式与模型。
+func TestForwardUpstreamRoutesByAuthAndModel(t *testing.T) {
 	tests := []struct {
 		name    string
 		auth    UpstreamAuth
@@ -639,32 +228,26 @@ func TestBuildOCRequestRoutesSharedAndGoOnlyModelsByAuthMode(t *testing.T) {
 		wantURL string
 	}{
 		{
-			name:    "public stays on zen free surface",
+			name:    "public stays on zen surface",
 			auth:    UpstreamAuth{Mode: AuthRoutePublic},
 			modelID: "deepseek-v4-flash-free",
 			wantURL: "https://opencode.ai/zen/v1/chat/completions",
 		},
 		{
-			name:    "bare key keeps shared model on zen",
-			auth:    UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-auto"},
-			modelID: "glm-5.2",
-			wantURL: "https://opencode.ai/zen/v1/chat/completions",
-		},
-		{
 			name:    "go prefix sends shared model to go surface",
-			auth:    UpstreamAuth{Mode: AuthRouteGo, Token: "sk-go"},
+			auth:    UpstreamAuth{Mode: AuthRouteGo, Token: "sk-gokey"},
 			modelID: "glm-5.2",
 			wantURL: "https://opencode.ai/zen/go/v1/chat/completions",
 		},
 		{
-			name:    "bare key still reaches go only models",
-			auth:    UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-auto"},
+			name:    "auto key sends go-only model to go surface",
+			auth:    UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-autokey"},
 			modelID: "kimi-k2.7-code",
 			wantURL: "https://opencode.ai/zen/go/v1/chat/completions",
 		},
 		{
-			name:    "zen prefix forces zen surface",
-			auth:    UpstreamAuth{Mode: AuthRouteZen, Token: "sk-zen"},
+			name:    "zen prefix forces zen surface for shared model",
+			auth:    UpstreamAuth{Mode: AuthRouteZen, Token: "sk-zenkey"},
 			modelID: "glm-5.2",
 			wantURL: "https://opencode.ai/zen/v1/chat/completions",
 		},
@@ -672,19 +255,50 @@ func TestBuildOCRequestRoutesSharedAndGoOnlyModelsByAuthMode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req, err := buildOCRequest(tt.modelID, map[string]any{"messages": []any{}}, tt.auth)
-			if err != nil {
-				t.Fatalf("buildOCRequest() error = %v", err)
+			transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+				{status: http.StatusOK, body: `{"id":"chatcmpl_test","choices":[]}`},
+			})
+			oldModelsCache := modelsCache
+			oldGoModelsCache := goModelsCache
+			modelMu.Lock()
+			modelsCache = []ModelInfo{
+				{ID: "glm-5.2"},
+				{ID: "deepseek-v4-flash-free"},
 			}
-			if got := req.URL.String(); got != tt.wantURL {
-				t.Fatalf("buildOCRequest() URL = %q, want %q", got, tt.wantURL)
+			goModelsCache = []ModelInfo{
+				{ID: "glm-5.2"},
+				{ID: "kimi-k2.7-code"},
+			}
+			modelMu.Unlock()
+			t.Cleanup(func() {
+				modelMu.Lock()
+				modelsCache = oldModelsCache
+				goModelsCache = oldGoModelsCache
+				modelMu.Unlock()
+			})
+
+			body := `{"model":"` + tt.modelID + `","messages":[]}`
+			resp, err := forwardUpstream([]byte(body), tt.auth.shouldUseGoEndpoint(tt.modelID), tt.auth)
+			if err != nil {
+				t.Fatalf("forwardUpstream() error = %v", err)
+			}
+			defer resp.Body.Close()
+
+			if got := transport.requests[0].URL.String(); got != tt.wantURL {
+				t.Fatalf("URL = %q, want %q", got, tt.wantURL)
 			}
 			wantAuth := "Bearer public"
 			if tt.auth.Mode != AuthRoutePublic {
 				wantAuth = "Bearer " + tt.auth.Token
 			}
-			if got := req.Header.Get("Authorization"); got != wantAuth {
-				t.Fatalf("buildOCRequest() Authorization = %q, want %q", got, wantAuth)
+			if got := transport.requests[0].Header.Get("Authorization"); got != wantAuth {
+				t.Fatalf("Authorization = %q, want %q", got, wantAuth)
+			}
+			if got := transport.requests[0].Header.Get("x-opencode-session"); got != "ses_test" {
+				t.Fatalf("x-opencode-session = %q, want ses_test", got)
+			}
+			if transport.rawBodies[0] != body {
+				t.Fatalf("forwarded body = %q, want %q (no model injection)", transport.rawBodies[0], body)
 			}
 		})
 	}
@@ -694,7 +308,6 @@ func TestListModelsHandlerSeparatesPublicZenAndGoCatalogs(t *testing.T) {
 	oldModelsCache := modelsCache
 	oldGoModelsCache := goModelsCache
 	oldModelsLoaded := modelsLoaded
-	oldModelAlias := modelAlias
 	modelMu.Lock()
 	modelsCache = []ModelInfo{
 		{ID: "deepseek-v4-flash-free"},
@@ -707,18 +320,12 @@ func TestListModelsHandlerSeparatesPublicZenAndGoCatalogs(t *testing.T) {
 	}
 	modelsLoaded = true
 	modelMu.Unlock()
-	configMu.Lock()
-	modelAlias = map[string]string{}
-	configMu.Unlock()
 	t.Cleanup(func() {
 		modelMu.Lock()
 		modelsCache = oldModelsCache
 		goModelsCache = oldGoModelsCache
 		modelsLoaded = oldModelsLoaded
 		modelMu.Unlock()
-		configMu.Lock()
-		modelAlias = oldModelAlias
-		configMu.Unlock()
 	})
 
 	tests := []struct {

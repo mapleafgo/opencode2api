@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -11,11 +10,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"net"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -425,48 +422,6 @@ func isGoCatalogOnlyModel(modelID string) bool {
 	return containsModelWithID(goModelsCache, modelID) && !containsModelWithID(modelsCache, modelID)
 }
 
-func getModelIDs() []string {
-	modelMu.RLock()
-	defer modelMu.RUnlock()
-	ids := make([]string, len(modelsCache))
-	for i, m := range modelsCache {
-		ids[i] = m.ID
-	}
-	return ids
-}
-
-func getGoModelIDs() []string {
-	modelMu.RLock()
-	defer modelMu.RUnlock()
-	ids := make([]string, len(goModelsCache))
-	for i, m := range goModelsCache {
-		ids[i] = m.ID
-	}
-	return ids
-}
-
-func filterFreeModels(ids []string) []string {
-	free := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if isFreeModel(id) {
-			free = append(free, id)
-		}
-	}
-	return free
-}
-
-// getCandidateModels 返回与当前认证权限一致的回退候选模型列表。
-// public 模式只回退到免费模型；带 key 的模式只回退到与目标模型走相同端点的模型，避免跨目录 401。
-func getCandidateModels(auth UpstreamAuth, modelID string) []string {
-	if auth.Mode == AuthRoutePublic {
-		return filterFreeModels(getModelIDs())
-	}
-	if auth.shouldUseGoEndpoint(modelID) {
-		return getGoModelIDs()
-	}
-	return getModelIDs()
-}
-
 // startModelRefresh 定时刷新模型列表（每 10 分钟）
 func startModelRefresh() {
 	go func() {
@@ -557,6 +512,7 @@ func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		r = r.WithContext(ctx)
 
 		slog.DebugContext(ctx, "request started",
+			slog.String("request_id", reqID),
 			slog.String("method", r.Method),
 			slog.String("path", r.URL.Path),
 			slog.String("remote", r.RemoteAddr),
@@ -576,12 +532,9 @@ func getReqID(ctx context.Context) string {
 // ======================== 配置 ========================
 
 var (
-	port               string
-	configPath         = "config.json"
-	modelAlias         = map[string]string{}
-	reasoningEffortMap = map[string]string{}
-	debugMode          bool
-	configMu           sync.RWMutex
+	port       string
+	configPath = "config.json"
+	debugMode  bool
 )
 
 // ======================== 管理面板认证 ========================
@@ -666,49 +619,9 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/login", http.StatusFound)
 }
 
-// ======================== Token 统计 ========================
-
-type ModelStats struct {
-	RequestCount     int64 `json:"request_count"`
-	PromptTokens     int64 `json:"prompt_tokens"`
-	CompletionTokens int64 `json:"completion_tokens"`
-	TotalTokens      int64 `json:"total_tokens"`
-}
-
-type TokenStatsData struct {
-	TotalRequests int64                  `json:"total_requests"`
-	Models        map[string]*ModelStats `json:"models"`
-}
-
-var (
-	tokenStats     = &TokenStatsData{Models: map[string]*ModelStats{}}
-	tokenStatsMu   sync.Mutex
-	tokenStatsPath = "stats.json"
-)
-
-// ======================== 数据模型 ========================
-
-type OpenAIRequest struct {
-	Model               string            `json:"model"`
-	Messages            []json.RawMessage `json:"messages"`
-	Stream              bool              `json:"stream"`
-	Temperature         *float64          `json:"temperature,omitempty"`
-	MaxTokens           int               `json:"max_tokens,omitempty"`
-	MaxCompletionTokens int               `json:"max_completion_tokens,omitempty"`
-	TopP                *float64          `json:"top_p,omitempty"`
-	Thinking            any               `json:"thinking,omitempty"`
-	ReasoningEffort     string            `json:"reasoning_effort,omitempty"`
-	ExtraBody           map[string]any    `json:"extra_body,omitempty"`
-	// Tools/ToolChoice 保持原始 JSON 透传，不做形态拦截。
-	Tools      []json.RawMessage `json:"tools,omitempty"`
-	ToolChoice json.RawMessage   `json:"tool_choice,omitempty"`
-}
-
 type AppConfig struct {
-	ModelAlias         map[string]string `json:"model_alias"`
-	ReasoningEffortMap map[string]string `json:"reasoning_effort_map"`
-	Socks5Proxies      []Socks5Proxy     `json:"socks5_proxies,omitempty"`
-	ActiveSocks5       string            `json:"active_socks5,omitempty"`
+	Socks5Proxies []Socks5Proxy `json:"socks5_proxies,omitempty"`
+	ActiveSocks5  string        `json:"active_socks5,omitempty"`
 }
 
 // ======================== 配置管理 ========================
@@ -734,15 +647,6 @@ func saveConfig(path string, cfg AppConfig) error {
 }
 
 func applyConfig(cfg AppConfig) {
-	configMu.Lock()
-	defer configMu.Unlock()
-	if cfg.ModelAlias != nil {
-		modelAlias = cfg.ModelAlias
-	}
-	if cfg.ReasoningEffortMap != nil {
-		reasoningEffortMap = cfg.ReasoningEffortMap
-	}
-
 	socks5Mu.Lock()
 	if cfg.Socks5Proxies != nil {
 		socks5Proxies = cfg.Socks5Proxies
@@ -755,199 +659,6 @@ func applyConfig(cfg AppConfig) {
 	}
 	socks5Mu.Unlock()
 
-}
-
-func resolveModel(model string) string {
-	m := strings.TrimSpace(model)
-	configMu.RLock()
-	alias, ok := modelAlias[m]
-	configMu.RUnlock()
-	if ok {
-		return alias
-	}
-	return m
-}
-
-func getReasoningEffortMap() map[string]string {
-	configMu.RLock()
-	defer configMu.RUnlock()
-	return maps.Clone(reasoningEffortMap)
-}
-
-// ======================== Token 统计 ========================
-
-func loadTokenStats() {
-	data, err := os.ReadFile(tokenStatsPath)
-	if err != nil {
-		return
-	}
-	var st TokenStatsData
-	if err := json.Unmarshal(data, &st); err != nil {
-		return
-	}
-	tokenStatsMu.Lock()
-	if st.Models == nil {
-		st.Models = map[string]*ModelStats{}
-	}
-	tokenStats = &st
-	tokenStatsMu.Unlock()
-}
-
-func saveTokenStats() {
-	tokenStatsMu.Lock()
-	data, err := json.MarshalIndent(tokenStats, "", "  ")
-	tokenStatsMu.Unlock()
-	if err != nil {
-		return
-	}
-	os.WriteFile(tokenStatsPath, data, 0644)
-}
-
-func recordTokenUsage(model string, promptTokens, completionTokens, totalTokens int64) {
-	tokenStatsMu.Lock()
-	tokenStats.TotalRequests++
-	ms, ok := tokenStats.Models[model]
-	if !ok {
-		ms = &ModelStats{}
-		tokenStats.Models[model] = ms
-	}
-	ms.RequestCount++
-	ms.PromptTokens += promptTokens
-	ms.CompletionTokens += completionTokens
-	ms.TotalTokens += totalTokens
-	tokenStatsMu.Unlock()
-	go saveTokenStats()
-}
-
-// ======================== 完整请求转换 ========================
-
-func convertRequest(req *OpenAIRequest) map[string]any {
-	converted := map[string]any{
-		"model":    req.Model,
-		"messages": req.Messages,
-		"stream":   req.Stream,
-	}
-	if req.Temperature != nil {
-		converted["temperature"] = *req.Temperature
-	}
-	if req.MaxTokens != 0 {
-		converted["max_tokens"] = req.MaxTokens
-	} else if req.MaxCompletionTokens != 0 {
-		// 客户端新字段 max_completion_tokens 映射为上游认识的 max_tokens。
-		converted["max_tokens"] = req.MaxCompletionTokens
-	}
-	if req.TopP != nil {
-		converted["top_p"] = *req.TopP
-	}
-	if req.Thinking != nil {
-		converted["thinking"] = req.Thinking
-	}
-	if req.ReasoningEffort != "" {
-		effort := req.ReasoningEffort
-		if mapped, ok := getReasoningEffortMap()[effort]; ok {
-			effort = mapped
-		}
-		converted["reasoning_effort"] = effort
-	}
-	if len(req.Tools) > 0 {
-		converted["tools"] = req.Tools
-	}
-	if req.ToolChoice != nil {
-		converted["tool_choice"] = req.ToolChoice
-	}
-	// 合并 ExtraBody
-	if req.ExtraBody != nil {
-		for k, v := range req.ExtraBody {
-			if _, exists := converted[k]; !exists {
-				converted[k] = v
-			}
-		}
-	}
-	return converted
-}
-
-func buildUpstreamBody(req *OpenAIRequest) []byte {
-	converted := convertRequest(req)
-	b, err := json.Marshal(converted)
-	if err != nil {
-		slog.Error("marshal upstream body failed", "error", err)
-	}
-	return b
-}
-
-// ======================== 消息处理 ========================
-
-// fixToolCallGaps 对齐工具调用历史：去掉同一 tool_call_id 的重复 tool
-// 响应，并保证 assistant 的每个 tool_calls 之后都有对应的 tool 结果，
-// 缺失时补占位消息。OpenAI 兼容上游要求 tool 消息不重复且紧跟 tool_calls。
-func fixToolCallGaps(messages []json.RawMessage) []json.RawMessage {
-	type rawMsg struct {
-		Role       string            `json:"role"`
-		ToolCallID string            `json:"tool_call_id"`
-		ToolCalls  []json.RawMessage `json:"tool_calls"`
-	}
-	toolResponses := map[string]json.RawMessage{}
-	for _, raw := range messages {
-		var m rawMsg
-		if json.Unmarshal(raw, &m) != nil {
-			continue
-		}
-		if m.Role == "tool" && m.ToolCallID != "" {
-			toolResponses[m.ToolCallID] = raw
-		}
-	}
-	fixed := make([]json.RawMessage, 0, len(messages)+len(messages)/4)
-	emitted := map[string]bool{}
-	for _, raw := range messages {
-		var m rawMsg
-		if json.Unmarshal(raw, &m) != nil {
-			fixed = append(fixed, raw)
-			continue
-		}
-		if m.Role == "tool" && m.ToolCallID != "" && emitted[m.ToolCallID] {
-			continue
-		}
-		fixed = append(fixed, raw)
-		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
-			continue
-		}
-		for _, tcRaw := range m.ToolCalls {
-			var tc struct {
-				ID string `json:"id"`
-			}
-			if json.Unmarshal(tcRaw, &tc) != nil || tc.ID == "" {
-				continue
-			}
-			if resp, ok := toolResponses[tc.ID]; ok {
-				fixed = append(fixed, resp)
-			} else {
-				placeholder, _ := json.Marshal(map[string]any{
-					"role":         "tool",
-					"tool_call_id": tc.ID,
-					"content":      "Tool call result not available",
-				})
-				fixed = append(fixed, placeholder)
-			}
-			emitted[tc.ID] = true
-		}
-	}
-	return fixed
-}
-
-// ======================== 响应透传 ========================
-
-// extractUsage 只解析 SSE 行中的 usage 用于 token 统计，响应内容本身原样透传
-func extractUsage(line string) map[string]any {
-	trimmed := strings.TrimSpace(line)
-	if !strings.HasPrefix(trimmed, "data: ") {
-		return nil
-	}
-	var raw map[string]any
-	if err := json.Unmarshal([]byte(strings.TrimSpace(trimmed[6:])), &raw); err != nil {
-		return nil
-	}
-	usage, _ := raw["usage"].(map[string]any)
-	return usage
 }
 
 // ======================== 认证层级 ========================
@@ -1035,23 +746,15 @@ func isFreeModel(modelID string) bool {
 	return strings.HasSuffix(modelID, "-free")
 }
 
-func buildOCRequest(modelID string, bodyMap map[string]any, auth UpstreamAuth) (*http.Request, error) {
-	return buildOCRequestWithEndpoint(modelID, bodyMap, auth, auth.shouldUseGoEndpoint(modelID))
-}
-
-func buildOCRequestWithEndpoint(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool) (*http.Request, error) {
-	bodyMap["model"] = modelID
-	tryBody, err := json.Marshal(bodyMap)
-	if err != nil {
-		return nil, err
-	}
-	var upstreamURL string
+// forwardUpstream 把客户端请求体原样转发到指定目录的上游接口，
+// 只做目录路由与会话头注入，不做任何请求体重构。
+func forwardUpstream(body []byte, useGoEndpoint bool, auth UpstreamAuth) (*http.Response, error) {
+	initOCSession()
+	upstreamURL := "https://opencode.ai/zen/v1/chat/completions"
 	if useGoEndpoint {
 		upstreamURL = "https://opencode.ai/zen/go/v1/chat/completions"
-	} else {
-		upstreamURL = "https://opencode.ai/zen/v1/chat/completions"
 	}
-	req, err := http.NewRequest("POST", upstreamURL, bytes.NewReader(tryBody))
+	req, err := http.NewRequest("POST", upstreamURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -1063,165 +766,7 @@ func buildOCRequestWithEndpoint(modelID string, bodyMap map[string]any, auth Ups
 	req.Header.Set("x-opencode-session", ocSessionID)
 	req.Header.Set("x-opencode-request", "req_"+randomString(24))
 	req.Header.Set("Accept", "application/json")
-	return req, nil
-}
-
-func shouldRetryUpstreamStatus(status int) bool {
-	// 仅重试可恢复的临时性错误
-	switch status {
-	case http.StatusUnauthorized, // 401 认证过期或 token 未同步
-		http.StatusTooManyRequests,    // 429 限流
-		http.StatusBadGateway,         // 502
-		http.StatusServiceUnavailable, // 503
-		http.StatusGatewayTimeout:     // 504
-		return true
-	}
-	// 其他 5xx 也重试，但 4xx 中只有 401 和 429 重试
-	return status >= 500 && status < 600
-}
-
-const (
-	maxUpstreamRetries = 3
-	max401Retries      = 3
-)
-
-func callOpenCodeAPI(upstreamBody []byte, modelID string, auth UpstreamAuth) ([]byte, int, http.Header, error) {
-	initOCSession()
-	candidates := getCandidateModels(auth, modelID)
-	modelsToTry := []string{modelID}
-	for _, m := range candidates {
-		if m != modelID {
-			modelsToTry = append(modelsToTry, m)
-		}
-	}
-	if len(modelsToTry) == 0 {
-		modelsToTry = []string{modelID}
-	}
-
-	var bodyMap map[string]any
-	if err := json.Unmarshal(upstreamBody, &bodyMap); err != nil {
-		return nil, 500, nil, fmt.Errorf("invalid request body")
-	}
-	useGoEndpoint := auth.shouldUseGoEndpoint(modelID)
-
-	var lastErr error
-	var retryCount int
-	var retry401Count int
-	var lastBody []byte
-	var lastStatus int
-	var lastHeader http.Header
-	for i, tryModel := range modelsToTry {
-		up, err := buildOCRequestWithEndpoint(tryModel, bodyMap, auth, useGoEndpoint)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		client := getHTTPClientForTier(auth.tier())
-		resp, err := client.Do(up)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			b, readErr := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if readErr != nil {
-				return nil, 0, nil, readErr
-			}
-			return b, resp.StatusCode, resp.Header, nil
-		}
-		errBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		slog.Error("upstream error", "model", tryModel, "status", resp.StatusCode, "body", string(errBody))
-		lastBody = errBody
-		lastStatus = resp.StatusCode
-		lastHeader = resp.Header
-		lastErr = fmt.Errorf("upstream error")
-		if shouldRetryUpstreamStatus(resp.StatusCode) && i < len(modelsToTry)-1 {
-			client.CloseIdleConnections()
-			if resp.StatusCode == http.StatusUnauthorized {
-				retry401Count++
-				if retry401Count >= max401Retries {
-					break
-				}
-			} else {
-				retryCount++
-				if retryCount >= maxUpstreamRetries {
-					break
-				}
-			}
-			continue
-		}
-		break
-	}
-	return lastBody, lastStatus, lastHeader, lastErr
-}
-
-func callOpenCodeAPIStream(upstreamBody []byte, modelID string, auth UpstreamAuth) (io.ReadCloser, int, http.Header, error) {
-	initOCSession()
-	candidates := getCandidateModels(auth, modelID)
-	modelsToTry := []string{modelID}
-	for _, m := range candidates {
-		if m != modelID {
-			modelsToTry = append(modelsToTry, m)
-		}
-	}
-	if len(modelsToTry) == 0 {
-		modelsToTry = []string{modelID}
-	}
-
-	var bodyMap map[string]any
-	if err := json.Unmarshal(upstreamBody, &bodyMap); err != nil {
-		return nil, 500, nil, fmt.Errorf("invalid request body")
-	}
-	useGoEndpoint := auth.shouldUseGoEndpoint(modelID)
-
-	var lastBody []byte
-	var lastStatus int
-	var lastHeader http.Header
-	var retryCount int
-	var retry401Count int
-	for i, tryModel := range modelsToTry {
-		up, err := buildOCRequestWithEndpoint(tryModel, bodyMap, auth, useGoEndpoint)
-		if err != nil {
-			continue
-		}
-		client := getHTTPClientForTier(auth.tier())
-		resp, err := client.Do(up)
-		if err != nil {
-			continue
-		}
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			return resp.Body, resp.StatusCode, resp.Header, nil
-		}
-		errBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		slog.Error("upstream error", "model", tryModel, "status", resp.StatusCode, "body", string(errBody))
-		lastBody = errBody
-		lastStatus = resp.StatusCode
-		lastHeader = resp.Header
-		if shouldRetryUpstreamStatus(resp.StatusCode) && i < len(modelsToTry)-1 {
-			client.CloseIdleConnections()
-			if resp.StatusCode == http.StatusUnauthorized {
-				retry401Count++
-				if retry401Count >= max401Retries {
-					break
-				}
-			} else {
-				retryCount++
-				if retryCount >= maxUpstreamRetries {
-					break
-				}
-			}
-			continue
-		}
-		// 返回错误体供下游透传
-		return io.NopCloser(bytes.NewReader(lastBody)), lastStatus, lastHeader, nil
-	}
-	if lastStatus != 0 {
-		return io.NopCloser(bytes.NewReader(lastBody)), lastStatus, lastHeader, nil
-	}
-	return nil, 500, nil, fmt.Errorf("all models failed")
+	return getHTTPClientForTier(auth.tier()).Do(req)
 }
 
 // ======================== 安全响应头过滤 ========================
@@ -1244,8 +789,7 @@ func filterResponseHeaders(h http.Header) http.Header {
 }
 
 // applyFilteredResponseHeaders 把上游的安全响应头（限流等）回传给客户端。
-// Content-Type 除外：流式/非流式的 Content-Type 都必须由本网关指定，透传
-// 上游值会把 text/event-stream 误标或漏标。白名单里保留它仅为语义完整。
+// Content-Type 由 chatCompletionsHandler 显式透传，避免 Go 自动嗅探覆盖上游类型。
 func applyFilteredResponseHeaders(w http.ResponseWriter, upHeader http.Header) {
 	for k, vs := range filterResponseHeaders(upHeader) {
 		if k == "Content-Type" {
@@ -1257,102 +801,6 @@ func applyFilteredResponseHeaders(w http.ResponseWriter, upHeader http.Header) {
 	}
 }
 
-// openAIError 是返回给 OpenAI 兼容客户端的标准错误结构。
-type openAIError struct {
-	Message string `json:"message"`
-	Type    string `json:"type"`
-	Code    string `json:"code,omitempty"`
-}
-
-// normalizeErrorBody 解析上游错误体为 openAIError，缺失字段补默认值，保证
-// 客户端总能从 message/type/code 稳定解析。无法解析时降级为通用错误。
-func normalizeErrorBody(body []byte, fallbackType string) openAIError {
-	err := openAIError{Message: "upstream error", Type: fallbackType}
-	if len(body) == 0 {
-		return err
-	}
-	var raw struct {
-		Error   json.RawMessage `json:"error"`
-		Message string          `json:"message"`
-		Detail  string          `json:"detail"`
-	}
-	if json.Unmarshal(body, &raw) != nil {
-		return err
-	}
-	// OpenAI 形态：{"error":{"message","type","code"}}
-	var obj struct {
-		Message any    `json:"message"`
-		Type    string `json:"type"`
-		Code    any    `json:"code"`
-	}
-	// 空对象（如 {"error":{}}）不视为 OpenAI 形态，继续走兜底
-	isOpenAIError := len(raw.Error) > 0 && string(raw.Error) != "null" && json.Unmarshal(raw.Error, &obj) == nil
-	if isOpenAIError && (obj.Message != nil || obj.Type != "" || obj.Code != nil) {
-		if m, ok := obj.Message.(string); ok && m != "" {
-			err.Message = m
-		}
-		if obj.Type != "" {
-			err.Type = obj.Type
-		}
-		switch c := obj.Code.(type) {
-		case string:
-			err.Code = c
-		case float64:
-			err.Code = strconv.FormatFloat(c, 'f', -1, 64)
-		}
-		return err
-	}
-	// 非 OpenAI 形态兜底：error 字符串 / 顶层 message / detail
-	var estr string
-	if json.Unmarshal(raw.Error, &estr) == nil && estr != "" {
-		err.Message = estr
-	} else if raw.Message != "" {
-		err.Message = raw.Message
-	} else if raw.Detail != "" {
-		err.Message = raw.Detail
-	}
-	return err
-}
-
-// writeErrorJSON 以 application/json 输出标准错误结构，保留上游状态码。
-// reqID 用于日志关联；5xx 记 Error（需人工介入），其余（429/400 等）记 Warn。
-func writeErrorJSON(w http.ResponseWriter, status int, e openAIError, reqID string) {
-	if status < 100 {
-		status = http.StatusInternalServerError
-	}
-	if status >= 500 {
-		slog.Error("upstream error response", "request_id", reqID, "status", status, "type", e.Type, "code", e.Code, "message", e.Message)
-	} else {
-		slog.Warn("upstream error response", "request_id", reqID, "status", status, "type", e.Type, "code", e.Code, "message", e.Message)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]any{"error": e})
-}
-
-// sendStreamError 在已经建立 SSE 流的中途发生错误时，补一个
-// finish_reason=error 的失败终态 chunk 再发 [DONE]，让客户端识别为
-// "本次生成失败"而不是被异常断开或误判为正常结束。
-func sendStreamError(w http.ResponseWriter, model string, e openAIError) {
-	chunk, _ := json.Marshal(map[string]any{
-		"id":      "chatcmpl_error",
-		"object":  "chat.completion.chunk",
-		"created": time.Now().Unix(),
-		"model":   model,
-		"choices": []map[string]any{{
-			"index":         0,
-			"delta":         map[string]any{},
-			"finish_reason": "error",
-		}},
-		"error": e,
-	})
-	fmt.Fprintf(w, "data: %s\n\n", chunk)
-	w.Write([]byte("data: [DONE]\n\n"))
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
 // ======================== Chat Completions Handler ========================
 
 func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
@@ -1360,7 +808,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 	auth := extractUpstreamAuth(r)
 	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
 	if err != nil {
@@ -1372,118 +820,36 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	reqID := getReqID(r.Context())
 	slog.Debug("chat completion request body", "request_id", reqID, "count", cnt, "body", string(body))
 
-	var req OpenAIRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+	// 仅解析 model 用于目录路由，其余字段原样透传、不改写。
+	var meta struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &meta)
+
+	start := time.Now()
+	upResp, err := forwardUpstream(body, auth.shouldUseGoEndpoint(meta.Model), auth)
+	if err != nil {
+		slog.Error("upstream request failed", "request_id", reqID, "error", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":{"message":"upstream request failed","type":"upstream_error"}}`))
 		return
 	}
-	req.Model = resolveModel(req.Model)
-	if req.Model == "" {
-		modelIDs := getModelIDs()
-		if len(modelIDs) > 0 {
-			req.Model = modelIDs[0]
-		} else {
-			req.Model = "deepseek-v4-flash-free"
-		}
-	}
+	defer func() { _ = upResp.Body.Close() }()
 
-	req.Messages = fixToolCallGaps(req.Messages)
-	if req.Stream {
-		if req.ExtraBody == nil {
-			req.ExtraBody = map[string]any{}
-		}
-		req.ExtraBody["stream_options"] = map[string]any{"include_usage": true}
+	switch {
+	case upResp.StatusCode >= 500:
+		slog.Error("upstream error response", "request_id", reqID, "status", upResp.StatusCode)
+	case upResp.StatusCode >= 400:
+		slog.Warn("upstream error response", "request_id", reqID, "status", upResp.StatusCode)
 	}
-	upstreamBody := buildUpstreamBody(&req)
-
-	if req.Stream {
-		upResp, status, upHeader, err := callOpenCodeAPIStream(upstreamBody, req.Model, auth)
-		if err != nil || status < 200 || status >= 300 {
-			applyFilteredResponseHeaders(w, upHeader)
-			var errBody []byte
-			if upResp != nil {
-				errBody, _ = io.ReadAll(upResp)
-				upResp.Close()
-			}
-			writeErrorJSON(w, status, normalizeErrorBody(errBody, "upstream_error"), reqID)
-			return
-		}
-		defer upResp.Close()
-		applyFilteredResponseHeaders(w, upHeader)
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(http.StatusOK)
-		reader := bufio.NewReader(upResp)
-		doneSeen := false
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				slog.Error("stream read error", "request_id", reqID, "error", err, "model", req.Model)
-				sendStreamError(w, req.Model, openAIError{
-					Message: "stream read error",
-					Type:    "stream_error",
-					Code:    "stream_error",
-				})
-				return
-			}
-			if doneSeen {
-				continue
-			}
-			trimmed := strings.TrimSpace(line)
-			if trimmed == "data: [DONE]" {
-				doneSeen = true
-				w.Write([]byte("data: [DONE]\n\n"))
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
-				}
-				continue
-			}
-
-			usage := extractUsage(line)
-			if usage != nil {
-				pt, _ := usage["prompt_tokens"].(float64)
-				ct, _ := usage["completion_tokens"].(float64)
-				tt, _ := usage["total_tokens"].(float64)
-				if tt > 0 {
-					recordTokenUsage(req.Model, int64(pt), int64(ct), int64(tt))
-				}
-			}
-
-			w.Write([]byte(line))
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-		}
-		return
+	applyFilteredResponseHeaders(w, upResp.Header)
+	if ct := upResp.Header.Get("Content-Type"); ct != "" {
+		w.Header().Set("Content-Type", ct)
 	}
-
-	respBody, status, upHeader, err := callOpenCodeAPI(upstreamBody, req.Model, auth)
-	if err != nil || status < 200 || status >= 300 {
-		applyFilteredResponseHeaders(w, upHeader)
-		writeErrorJSON(w, status, normalizeErrorBody(respBody, "upstream_error"), reqID)
-		return
-	}
-	applyFilteredResponseHeaders(w, upHeader)
-	outBody := respBody
-	// Record token usage
-	var usageResp map[string]any
-	if json.Unmarshal(respBody, &usageResp) == nil {
-		if u, ok := usageResp["usage"].(map[string]any); ok {
-			pt, _ := u["prompt_tokens"].(float64)
-			ct, _ := u["completion_tokens"].(float64)
-			tt, _ := u["total_tokens"].(float64)
-			if tt > 0 {
-				recordTokenUsage(req.Model, int64(pt), int64(ct), int64(tt))
-			}
-		}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	w.Write(outBody)
+	w.WriteHeader(upResp.StatusCode)
+	_, _ = io.Copy(w, upResp.Body)
+	slog.Debug("chat completion finished", "request_id", reqID, "status", upResp.StatusCode, "duration_ms", time.Since(start).Milliseconds())
 }
 
 // ======================== Models Handler ========================
@@ -1514,19 +880,6 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// 追加别名模型
-	configMu.RLock()
-	aliases := make([]string, 0, len(modelAlias))
-	for k := range modelAlias {
-		aliases = append(aliases, k)
-	}
-	configMu.RUnlock()
-	now := time.Now().Unix()
-	aliasModels := make([]ModelInfo, 0, len(aliases))
-	for _, alias := range aliases {
-		aliasModels = append(aliasModels, ModelInfo{ID: alias, Object: "model", Created: now, OwnedBy: "alias"})
-	}
-
 	auth := extractUpstreamAuth(r)
 	var combinedModels []ModelInfo
 	switch {
@@ -1544,37 +897,23 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		modelMu.RUnlock()
-	case auth.Mode == AuthRoutePublic:
+	default:
 		combinedModels = models
+	}
+	if auth.Mode == AuthRoutePublic {
 		filtered := make([]ModelInfo, 0, len(combinedModels))
 		for _, m := range combinedModels {
 			if isFreeModel(m.ID) {
 				filtered = append(filtered, m)
 			}
 		}
-		if len(filtered) > 0 {
-			combinedModels = filtered
-		}
-	default:
-		combinedModels = models
-	}
-	allModels := append(combinedModels, aliasModels...)
-	if auth.Mode == AuthRoutePublic {
-		filtered := make([]ModelInfo, 0, len(allModels))
-		for _, m := range allModels {
-			if isFreeModel(m.ID) {
-				filtered = append(filtered, m)
-			}
-		}
-		if len(filtered) > 0 {
-			allModels = filtered
-		}
+		combinedModels = filtered
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"object": "list",
-		"data":   allModels,
+		"data":   combinedModels,
 	})
 }
 
@@ -1613,9 +952,7 @@ func reloadHandler(w http.ResponseWriter, r *http.Request) {
 func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		configMu.RLock()
-		cfg := AppConfig{ModelAlias: modelAlias, ReasoningEffortMap: reasoningEffortMap}
-		configMu.RUnlock()
+		var cfg AppConfig
 		socks5Mu.RLock()
 		cfg.Socks5Proxies = socks5Proxies
 		cfg.ActiveSocks5 = activeSocks5
@@ -1634,32 +971,8 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		applyConfig(cfg)
 		if debugMode {
-			slog.Info("config updated", "aliases", len(cfg.ModelAlias), "effort_map", len(cfg.ReasoningEffortMap))
+			slog.Info("config updated", "proxies", len(cfg.Socks5Proxies), "active", cfg.ActiveSocks5)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-func adminStatsHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		tokenStatsMu.Lock()
-		data, err := json.Marshal(tokenStats)
-		tokenStatsMu.Unlock()
-		if err != nil {
-			http.Error(w, `{"error":"marshal error"}`, http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(data)
-	case http.MethodDelete:
-		tokenStatsMu.Lock()
-		tokenStats = &TokenStatsData{Models: map[string]*ModelStats{}}
-		tokenStatsMu.Unlock()
-		saveTokenStats()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	default:
@@ -1755,118 +1068,48 @@ const adminHTML = `<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-:root {
-  --bg: #f4f6fa;
-  --surface: #ffffff;
-  --surface-2: #f0f2f7;
-  --border: #e2e6ed;
-  --border-light: #d0d4df;
-  --text: #1a1d26;
-  --text-sec: #6a7180;
-  --text-ter: #9ca3b0;
-  --accent: #6c8aff;
-  --accent-dim: rgba(108,138,255,.08);
-  --accent-hover: #5a78f0;
-  --green: #22a85a;
-  --green-dim: rgba(34,168,90,.08);
-  --green-hover: #1d9850;
-  --orange: #d9600a;
-  --orange-dim: rgba(217,96,10,.08);
-  --orange-hover: #c45507;
-  --red: #dc2626;
-  --red-dim: rgba(220,38,38,.08);
-  --radius: 12px;
-  --radius-sm: 8px;
-  --font: 'Noto Sans SC', system-ui, -apple-system, sans-serif;
-  --mono: 'JetBrains Mono', Consolas, monospace;
-  --glow-a: rgba(108,138,255,.03);
-  --glow-b: rgba(61,214,140,.02);
-  --stats-total-bg: #f0f2f7;
-}
-[data-theme="dark"] {
-  --bg: #0c0e14;
-  --surface: #14161e;
-  --surface-2: #1a1d27;
-  --border: #252835;
-  --border-light: #2e3142;
-  --text: #e8eaf0;
-  --text-sec: #8b90a5;
-  --text-ter: #5c6080;
-  --accent: #6c8aff;
-  --accent-dim: rgba(108,138,255,.12);
-  --accent-hover: #5a78f0;
-  --green: #3dd68c;
-  --green-dim: rgba(61,214,140,.12);
-  --green-hover: #30c47a;
-  --orange: #f0a050;
-  --orange-dim: rgba(240,160,80,.12);
-  --orange-hover: #e09040;
-  --red: #f06060;
-  --red-dim: rgba(240,96,96,.12);
-  --glow-a: rgba(108,138,255,.04);
-  --glow-b: rgba(61,214,140,.03);
-  --stats-total-bg: var(--surface-2);
-}
+:root{--bg:#f4f6fa;--surface:#fff;--surface-2:#f0f2f7;--border:#e2e6ed;--text:#1a1d26;--text-sec:#6a7180;--text-ter:#9ca3b0;--accent:#6c8aff;--accent-dim:rgba(108,138,255,.08);--accent-hover:#5a78f0;--green:#22a85a;--green-dim:rgba(34,168,90,.08);--green-hover:#1d9850;--red:#dc2626;--red-dim:rgba(220,38,38,.08);--radius:12px;--radius-sm:8px;--font:'Noto Sans SC',system-ui,-apple-system,sans-serif;--mono:'JetBrains Mono',Consolas,monospace}
+[data-theme="dark"]{--bg:#0c0e14;--surface:#14161e;--surface-2:#1a1d27;--border:#252835;--text:#e8eaf0;--text-sec:#8b90a5;--text-ter:#5c6080;--accent:#6c8aff;--accent-dim:rgba(108,138,255,.12);--accent-hover:#5a78f0;--green:#3dd68c;--green-dim:rgba(61,214,140,.12);--green-hover:#30c47a;--red:#f06060;--red-dim:rgba(240,96,96,.12)}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:14px;line-height:1.6;min-height:100vh}
-body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%;background:radial-gradient(ellipse at 30% 20%,var(--glow-a) 0%,transparent 50%),radial-gradient(ellipse at 70% 80%,var(--glow-b) 0%,transparent 50%);pointer-events:none;z-index:0}
-.container{max-width:1020px;margin:0 auto;padding:32px 24px;position:relative;z-index:1}
-header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bottom:20px;border-bottom:1px solid var(--border);justify-content:space-between}
+.container{max-width:820px;margin:0 auto;padding:32px 24px}
+header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px;padding-bottom:20px;border-bottom:1px solid var(--border)}
 .logo{display:flex;align-items:center;gap:10px}
 .logo-mark{width:36px;height:36px;background:linear-gradient(135deg,var(--accent),#8b6cff);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px;color:#fff;flex-shrink:0}
-.logo-text{font-size:22px;font-weight:700;letter-spacing:-.5px;background:linear-gradient(135deg,var(--text),var(--text-sec));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.logo-sub{font-size:12.5px;color:var(--text-ter);margin-bottom:2px}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:22px 24px;transition:border-color .2s}
-.card:hover{border-color:var(--border-light)}
-.card h2{font-size:13px;font-weight:600;margin-bottom:16px;letter-spacing:.2px;display:flex;align-items:center;gap:8px;color:var(--text-sec);text-transform:uppercase}
-.card h2 .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
-.config-grid{display:grid;grid-template-columns:2fr 3fr;gap:16px;margin-top:16px}
-.config-grid .card{margin-bottom:0}
-.full-row{grid-column:1/-1}
+.logo-text{font-size:20px;font-weight:700}
+.logo-sub{font-size:12px;color:var(--text-ter);margin-top:2px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:22px 24px}
+.card h2{font-size:13px;font-weight:600;margin-bottom:16px;color:var(--text-sec);display:flex;align-items:center;gap:8px}
+.card h2 .dot{width:6px;height:6px;border-radius:50%}
 .form-group{margin-bottom:14px}
 .form-group:last-child{margin-bottom:0}
-.form-group label{display:block;font-size:11.5px;font-weight:500;color:var(--text-ter);margin-bottom:5px;letter-spacing:.4px;text-transform:uppercase}
-.form-group input[type="text"],.form-group input[type="url"],.form-group input[type="password"],.form-group textarea,.form-group select,.m-select{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--mono);background:var(--surface-2);color:var(--text);transition:border-color .15s,box-shadow .15s}
-.form-group input:focus,.form-group textarea:focus,.form-group select:focus,.m-select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}
-.form-group .hint{font-size:11px;color:var(--text-ter);margin-top:4px;line-height:1.4}
+.form-group label{display:block;font-size:11.5px;font-weight:500;color:var(--text-ter);margin-bottom:5px}
+.form-group input,.m-select{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--mono);background:var(--surface-2);color:var(--text)}
+.form-group input:focus,.m-select:focus{outline:none;border-color:var(--accent)}
+.form-group .hint{font-size:11px;color:var(--text-ter);margin-top:4px}
 .actions{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
-.btn{padding:8px 16px;border-radius:var(--radius-sm);font-size:12.5px;font-weight:500;cursor:pointer;border:none;transition:all .15s;font-family:var(--font);white-space:nowrap}
+.btn{padding:8px 16px;border-radius:var(--radius-sm);font-size:12.5px;font-weight:500;cursor:pointer;border:none;font-family:var(--font);white-space:nowrap}
 .btn-primary{background:var(--accent-dim);color:var(--accent)}
 .btn-primary:hover{background:var(--accent);color:#fff}
-.btn-default{background:var(--surface-2);color:var(--text-sec);border:1px solid var(--border)}
-.btn-default:hover{border-color:var(--border-light);color:var(--text)}
 .btn-success{background:var(--green-dim);color:var(--green)}
 .btn-success:hover{background:var(--green);color:#fff}
-.btn-warning{background:var(--orange-dim);color:var(--orange)}
-.btn-warning:hover{background:var(--orange);color:#fff}
 .btn-danger{background:var(--red-dim);color:var(--red)}
 .btn-danger:hover{background:var(--red);color:#fff}
 .tbl{width:100%;border-collapse:collapse;font-size:12.5px}
-.tbl th{text-align:left;font-weight:500;color:var(--text-ter);padding:8px 10px;border-bottom:1px solid var(--border);font-size:11px;letter-spacing:.4px;text-transform:uppercase;white-space:nowrap}
+.tbl th{text-align:left;font-weight:500;color:var(--text-ter);padding:8px 10px;border-bottom:1px solid var(--border);font-size:11px;white-space:nowrap}
 .tbl td{padding:7px 10px;border-bottom:1px solid var(--border)}
 .tbl tr:last-child td{border-bottom:none}
-.tbl input{width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:12.5px;font-family:var(--mono);background:var(--surface-2);color:var(--text);transition:border-color .15s,box-shadow .15s}
-.tbl input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-dim)}
-.tbl .m-select{padding:6px 10px;font-size:12.5px}
-.tbl th:last-child{width:52px}
+.tbl input{width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:12.5px;font-family:var(--mono);background:var(--surface-2);color:var(--text)}
+.tbl input:focus{outline:none;border-color:var(--accent)}
+.tbl th:last-child{width:60px}
 .tbl td:last-child{white-space:nowrap;text-align:center}
-#statsTable th:last-child{width:auto}
-#statsTable td:last-child{text-align:left;white-space:nowrap}
-.tbl .btn{padding:4px 10px;font-size:11px;white-space:nowrap}
-#statsTable td:first-child{font-weight:500;color:var(--text)}
-#statsTable td:not(:first-child){font-family:var(--mono);color:var(--text-sec);text-align:left}
-#statsTable tbody tr:hover{background:var(--surface-2)}
-#statsTable thead+tbody tr:last-child td{font-weight:600;color:var(--text);background:var(--stats-total-bg);border-top:1px solid var(--border-light)}
-.stats-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px}
-.stats-header .btns{display:flex;gap:6px;align-items:center}
-#toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:var(--radius-sm);font-size:13px;font-weight:500;color:#fff;opacity:0;transition:opacity .25s,transform .25s;z-index:999;transform:translateY(-8px);pointer-events:none;backdrop-filter:blur(8px)}
+.theme-toggle{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 12px;cursor:pointer;font-size:16px;color:var(--text-sec)}
+#toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:var(--radius-sm);font-size:13px;font-weight:500;color:#fff;opacity:0;transition:opacity .25s;z-index:999;pointer-events:none}
 #toast.success{background:rgba(61,214,140,.85)}
 #toast.error{background:rgba(240,96,96,.85)}
-#toast.show{opacity:1;transform:translateY(0)}
-.empty-hint{color:var(--text-ter);font-size:13px;padding:28px;text-align:center}
-@media(max-width:700px){.config-grid{grid-template-columns:1fr}.container{padding:16px 12px}header{flex-direction:column;align-items:flex-start;gap:8px}}
-.theme-toggle{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 12px;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;transition:all .15s;color:var(--text-sec);flex-shrink:0;line-height:1}
-.theme-toggle:hover{border-color:var(--border-light);color:var(--text)}
+#toast.show{opacity:1}
+.empty-hint{color:var(--text-ter);font-size:13px;padding:24px;text-align:center}
+@media(max-width:640px){.container{padding:16px 12px}header{flex-direction:column;align-items:flex-start;gap:10px}}
 </style>
 </head>
 <body>
@@ -1876,63 +1119,20 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 <div class="logo-mark">⌨</div>
 <div>
 <div class="logo-text">OPENCODE TO API</div>
-<div class="logo-sub">OpenCode 免费 API → 兼容格式代理</div>
+<div class="logo-sub">OpenCode 兼容代理管理</div>
 </div>
 </div>
 <div style="display:flex;align-items:center;gap:8px">
 <button class="theme-toggle" onclick="toggleTheme()" title="切换主题">☀</button>
-<form method="post" action="/logout" style="margin:0"><button class="theme-toggle" type="submit" title="退出登录" style="font-size:14px">退出</button></form>
+<form method="post" action="/logout" style="margin:0"><button class="theme-toggle" type="submit">退出</button></form>
 </div>
 </header>
 
 <div class="card">
-<div class="stats-header">
-<h2><span class="dot" style="background:var(--green)"></span>Token 统计</h2>
-<div class="btns">
-<button class="btn btn-success" onclick="reloadConfig()">刷新</button>
-<button class="btn btn-danger" onclick="resetStats()">清空统计</button>
-<span id="resetStatus" style="font-size:11px;color:var(--text-ter)"></span>
-</div>
-</div>
-<div id="statsContent" style="font-size:12.5px">
-<div class="empty-hint">加载中...</div>
-</div>
-</div>
-
-<div class="config-grid">
-<div class="card">
-<h2><span class="dot" style="background:var(--orange)"></span>推理力度映射</h2>
-<div style="margin-bottom:12px">
-<table class="tbl" id="effortTable">
-<thead><tr><th style="width:35%">请求值</th><th style="width:42%">映射值</th><th style="width:23%"></th></tr></thead>
-<tbody></tbody>
-</table>
-</div>
-<div class="actions">
-<button class="btn btn-primary" onclick="addEffortRow()">添加映射</button>
-<button class="btn btn-success" onclick="saveConfig()">保存全部</button>
-</div>
-</div>
-
-<div class="card">
-<h2><span class="dot" style="background:var(--accent)"></span>模型映射</h2>
-<div style="margin-bottom:12px">
-<table class="tbl" id="aliasTable">
-<thead><tr><th style="width:35%">别名（请求名）</th><th style="width:42%">实际模型（上游名）</th><th style="width:23%"></th></tr></thead>
-<tbody></tbody>
-</table>
-</div>
-<div class="actions">
-<button class="btn btn-primary" onclick="addAliasRow()">添加别名</button>
-<button class="btn btn-success" onclick="saveConfig()">保存全部</button>
-</div>
-</div>
-
-<div class="card full-row">
 <h2><span class="dot" style="background:var(--accent)"></span>SOCKS5 代理</h2>
 <div style="margin-bottom:12px">
 <table class="tbl" id="socks5Table">
-<thead><tr><th style="width:25%">名称</th><th style="width:28%">地址</th><th style="width:17%">用户名</th><th style="width:17%">密码</th><th style="width:13%"></th></tr></thead>
+<thead><tr><th style="width:22%">名称</th><th style="width:26%">地址</th><th style="width:18%">用户名</th><th style="width:18%">密码</th><th></th></tr></thead>
 <tbody></tbody>
 </table>
 </div>
@@ -1945,37 +1145,26 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 <div class="actions">
 <button class="btn btn-primary" onclick="addSocks5Row()">添加代理</button>
 <button class="btn btn-success" onclick="saveConfig()">保存全部</button>
-</div>
+<button class="btn btn-success" onclick="reloadConfig()">刷新会话</button>
 </div>
 </div>
 </div>
 <div id="toast"></div>
 <script>
-let aliasData={},effortData={},modelList=[],socks5Data=[];
-function toggleTheme(){const d=document.documentElement;const cur=d.getAttribute('data-theme');const next=cur==='dark'?null:'dark';if(next)d.setAttribute('data-theme',next);else d.removeAttribute('data-theme');localStorage.setItem('theme',next||'light');document.querySelector('.theme-toggle').textContent=next==='dark'?'🌙':'☀'}
-(function(){const t=localStorage.getItem('theme');if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');document.addEventListener('DOMContentLoaded',()=>{const b=document.querySelector('.theme-toggle');if(b)b.textContent='🌙'})}})();
-function reloadConfig(){const sy=window.scrollY;fetch('/api/reload',{method:'POST'}).then(r=>r.json()).then(d=>{showToast('会话已刷新，模型 '+d.models+' 个','success')}).catch(()=>{}).finally(()=>{loadConfig();loadStats();setTimeout(()=>window.scrollTo(0,sy),100)})}
-async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];const mr=await fetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id).sort();renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||'';setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
-function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无别名配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+modelSelectHtml(aliasData[k])+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>').join('')}
-function modelSelectHtml(selected){let h='<select data-field="val" class="m-select">';h+='<option value="">-- 选择模型 --</option>';for(const m of modelList){h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}h+='</select>';return h}
-function addAliasRow(){const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td>'+modelSelectHtml('')+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>')}
-function delAlias(btn){const row=btn.closest('tr');const ki=row.querySelector('[data-field="key"]');if(ki&&ki.value&&aliasData[ki.value])delete aliasData[ki.value];row.remove();if(!Object.keys(aliasData).length)document.querySelector('#aliasTable tbody').innerHTML='<tr><td colspan="3" class="empty-hint">暂无别名配置</td></tr>'}
-function collectAliases(){const r={};document.querySelectorAll('#aliasTable tbody tr').forEach(tr=>{const k=tr.querySelector('[data-field="key"]'),v=tr.querySelector('[data-field="val"]');if(k&&k.value.trim())r[k.value.trim()]=v?v.value.trim():''});aliasData=r;return r}
-function renderEffortTable(){const tb=document.querySelector('#effortTable tbody');const ks=Object.keys(effortData);if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无映射配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td><input value="'+esc(k)+'" data-field="key"></td><td><input value="'+esc(effortData[k])+'" data-field="val"></td><td><button class="btn btn-danger" onclick="delEffort(this)">删除</button></td></tr>').join('')}
-function addEffortRow(){const tb=document.querySelector('#effortTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: low" data-field="key"></td><td><input value="" placeholder="例如: high" data-field="val"></td><td><button class="btn btn-danger" onclick="delEffort(this)">删除</button></td></tr>')}
-function delEffort(btn){const row=btn.closest('tr');const ki=row.querySelector('[data-field="key"]');if(ki&&ki.value&&effortData[ki.value])delete effortData[ki.value];row.remove();if(!Object.keys(effortData).length)document.querySelector('#effortTable tbody').innerHTML='<tr><td colspan="3" class="empty-hint">暂无映射配置</td></tr>'}
-function collectEfforts(){const r={};document.querySelectorAll('#effortTable tbody tr').forEach(tr=>{const k=tr.querySelector('[data-field="key"]'),v=tr.querySelector('[data-field="val"]');if(k&&k.value.trim())r[k.value.trim()]=v?v.value.trim():''});effortData=r;return r}
-function renderSocks5Table(){const tb=document.querySelector('#socks5Table tbody');if(!socks5Data.length){tb.innerHTML='<tr><td colspan="5" class="empty-hint">暂无代理配置</td></tr>';return}tb.innerHTML=socks5Data.map((p,i)=>'<tr><td><input value="'+esc(p.name||'')+'" data-field="name"></td><td><input value="'+esc(p.addr)+'" data-field="addr" placeholder="例如: 127.0.0.1:1080"></td><td><input value="'+esc(p.username||'')+'" data-field="username"></td><td><input value="'+esc(p.password||'')+'" data-field="password" type="password"></td><td><button class="btn btn-danger" onclick="delSocks5('+i+')">删除</button></td></tr>').join('');renderSocks5Select()}
+let socks5Data=[];
+function toggleTheme(){const d=document.documentElement;const n=d.getAttribute('data-theme')==='dark'?'light':'dark';if(n==='dark')d.setAttribute('data-theme','dark');else d.removeAttribute('data-theme');localStorage.setItem('theme',n);document.querySelector('.theme-toggle').textContent=n==='dark'?'🌙':'☀'}
+(function(){const t=localStorage.getItem('theme');if(t==='dark')document.documentElement.setAttribute('data-theme','dark')})();
+async function loadConfig(){const r=await fetch('/api/config');const cfg=await r.json();socks5Data=cfg.socks5_proxies||[];renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||''}
+function renderSocks5Table(){const tb=document.querySelector('#socks5Table tbody');if(!socks5Data.length){tb.innerHTML='<tr><td colspan="5" class="empty-hint">暂无代理配置</td></tr>';renderSocks5Select();return}tb.innerHTML=socks5Data.map((p,i)=>'<tr><td><input value="'+esc(p.name||'')+'" data-field="name"></td><td><input value="'+esc(p.addr)+'" data-field="addr" placeholder="127.0.0.1:1080"></td><td><input value="'+esc(p.username||'')+'" data-field="username"></td><td><input value="'+esc(p.password||'')+'" data-field="password" type="password"></td><td><button class="btn btn-danger" onclick="delSocks5('+i+')">删除</button></td></tr>').join('');renderSocks5Select()}
 function addSocks5Row(){const tb=document.querySelector('#socks5Table tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';socks5Data.push({addr:'',name:''});renderSocks5Table()}
 function delSocks5(i){socks5Data.splice(i,1);renderSocks5Table()}
 function collectSocks5(){const r=[];document.querySelectorAll('#socks5Table tbody tr').forEach(tr=>{const a=tr.querySelector('[data-field="addr"]');if(a&&a.value.trim())r.push({addr:a.value.trim(),name:(tr.querySelector('[data-field="name"]')||{}).value?.trim()||'',username:(tr.querySelector('[data-field="username"]')||{}).value?.trim()||'',password:(tr.querySelector('[data-field="password"]')||{}).value?.trim()||''})});socks5Data=r;return r}
-function renderSocks5Select(){const sel=document.getElementById('activeSocks5');const cur=sel.value;sel.innerHTML='<option value="">直连（不使用代理）</option>';socks5Data.forEach(p=>{if(p.addr){const label=p.name?p.name+' ('+p.addr+')':p.addr;const opt=document.createElement('option');opt.value=p.addr;opt.textContent=label;sel.appendChild(opt)}});if(socks5Data.length>=2){const opt=document.createElement('option');opt.value='__round_robin__';opt.textContent='轮询（自动切换）';sel.appendChild(opt)}sel.value=cur;if(!sel.value)sel.value='';}
-async function saveConfig(){collectAliases();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
+function renderSocks5Select(){const sel=document.getElementById('activeSocks5');const cur=sel.value;sel.innerHTML='<option value="">直连（不使用代理）</option>';socks5Data.forEach(p=>{if(p.addr){const label=p.name?p.name+' ('+p.addr+')':p.addr;const opt=document.createElement('option');opt.value=p.addr;opt.textContent=label;sel.appendChild(opt)}});if(socks5Data.length>=2){const opt=document.createElement('option');opt.value='__round_robin__';opt.textContent='轮询（自动切换）';sel.appendChild(opt)}sel.value=cur;if(!sel.value)sel.value=''}
+async function saveConfig(){collectSocks5();const cfg={socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
+async function reloadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/reload',{method:'POST'});if(!r.ok)throw new Error(await r.text());const d=await r.json();showToast('会话已刷新，Go 模型 '+d.go+' 个','success')}catch(e){showToast('刷新失败: '+e.message,'error')}setTimeout(()=>window.scrollTo(0,sy),100)}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function showToast(msg,t){const e=document.getElementById('toast');e.textContent=msg;e.className=t+' show';clearTimeout(e._tid);e._tid=setTimeout(()=>e.classList.remove('show'),2500)}
-async function resetStats(){if(!confirm('确认清空所有 Token 统计？\n此操作不可撤销。'))return;const s=document.getElementById('resetStatus');s.textContent='清空中...';try{const r=await fetch('/api/stats',{method:'DELETE'});if(!r.ok)throw new Error(await r.text());document.getElementById('statsContent').innerHTML='<div class="empty-hint">暂无数据</div>';s.textContent='已清空';setTimeout(()=>s.textContent='',2000)}catch(e){s.textContent='失败: '+e.message}}
-async function loadStats(){try{const r=await fetch('/api/stats');const d=await r.json();const ms=d.models||{};const ks=Object.keys(ms);let h='<table class="tbl" id="statsTable"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';if(!ks.length){h+='<tr><td colspan="5" class="empty-hint">暂无数据</td></tr>'}else{let tr=0,pt=0,ct=0,tt=0;for(const k of ks){const m=ms[k];h+='<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>';tr+=m.request_count;pt+=m.prompt_tokens;ct+=m.completion_tokens;tt+=m.total_tokens}h+='<tr><td>总计</td><td>'+fmt(tr)+'</td><td>'+fmt(pt)+'</td><td>'+fmt(ct)+'</td><td>'+fmt(tt)+'</td></tr>'}h+='</tbody></table>';document.getElementById('statsContent').innerHTML=h}catch(e){document.getElementById('statsContent').innerHTML='<div class="empty-hint">加载失败</div>'}}
-function fmt(n){return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g,',')}window.onload=function(){loadConfig();loadStats()};setInterval(loadStats,5000);document.addEventListener('visibilitychange',function(){if(!document.hidden)loadStats()});
+window.onload=loadConfig;
 </script>
 </body>
 </html>`
@@ -2006,7 +1195,6 @@ func main() {
 		slog.Warn("failed to save config", "path", configPath, "error", err)
 	}
 
-	loadTokenStats()
 	slog.Info("config loaded", "path", configPath)
 	initOCSession()
 	models, err := fetchModels()
@@ -2033,8 +1221,7 @@ func main() {
 	slog.Info("server starting",
 		"port", port,
 		"log_level", logLevel,
-		"models", len(getModelIDs()),
-		"aliases", len(modelAlias),
+		"models", len(modelsCache),
 	)
 	if adminPassword != "" {
 		slog.Info("admin panel enabled", "url", fmt.Sprintf("http://localhost:%s/", port))
@@ -2057,7 +1244,6 @@ func registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/login", loggingMiddleware(loginHandler))
 	mux.HandleFunc("/logout", loggingMiddleware(logoutHandler))
 	mux.HandleFunc("/api/config", loggingMiddleware(requireAuth(adminConfigHandler)))
-	mux.HandleFunc("/api/stats", loggingMiddleware(requireAuth(adminStatsHandler)))
 	mux.HandleFunc("/api/reload", loggingMiddleware(requireAuth(reloadHandler)))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
