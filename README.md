@@ -10,6 +10,7 @@
 - Chat Completions API 流级透传：请求体与 SSE 响应原样转发，无任何改写
 - OpenCode 会话头注入与 Zen/Go/public 三层目录路由
 - SOCKS5 直连、指定代理和轮询代理
+- 配置路径环境变量与用户目录回退；收到终止信号后优雅停机
 - Web 管理面板：SOCKS5 配置、刷新上游会话
 - GitHub Actions 自动构建 Linux、macOS、Windows、FreeBSD 多平台 release
 - GitHub Actions 自动发布 Docker 镜像到 GHCR
@@ -22,6 +23,9 @@ cd opencode2api
 cp config.example.json config.json
 go run . -port 8000 -config config.json -password "change-me"
 ```
+
+未显式指定 `-config` 且当前目录没有 `config.json` 时，会回退到用户配置目录下的
+`opencode2api/config.json`。
 
 健康检查：
 
@@ -76,7 +80,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 -port string
     服务端口，默认 8000
 -config string
-    配置文件路径，默认 config.json
+    配置文件路径；未显式指定时按当前目录旧文件和用户目录回退解析
 -password string
     管理面板密码，默认 123456；留空表示不启用登录验证
 -debug

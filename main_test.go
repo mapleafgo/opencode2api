@@ -1,14 +1,21 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestVersionStringIncludesBuildMetadata(t *testing.T) {
@@ -29,10 +36,256 @@ func TestVersionStringIncludesBuildMetadata(t *testing.T) {
 	}
 }
 
+func TestAppConfigSocks5PaidDirect(t *testing.T) {
+	var cfg AppConfig
+	if err := json.Unmarshal([]byte(`{"socks5_paid_direct":true}`), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Socks5PaidDirect {
+		t.Fatal("socks5_paid_direct=true was not decoded")
+	}
+
+	oldPaidDirect := socks5PaidDirect
+	t.Cleanup(func() {
+		socks5Mu.Lock()
+		socks5PaidDirect = oldPaidDirect
+		socks5Mu.Unlock()
+	})
+
+	applyConfig(cfg)
+	socks5Mu.RLock()
+	got := socks5PaidDirect
+	socks5Mu.RUnlock()
+	if !got {
+		t.Fatal("applyConfig did not enable paid direct")
+	}
+}
+
+func TestGetHTTPClientForTierSocks5PaidDirectDefaultUsesProxy(t *testing.T) {
+	oldHTTPClient := httpClient
+	oldProxies := socks5Proxies
+	oldActive := activeSocks5
+	oldPaidDirect := socks5PaidDirect
+	oldClient := socks5Client
+	oldClientAddr := socks5ClientAddr
+	t.Cleanup(func() {
+		httpClient = oldHTTPClient
+		socks5Mu.Lock()
+		socks5Proxies = oldProxies
+		activeSocks5 = oldActive
+		socks5PaidDirect = oldPaidDirect
+		socks5Client = oldClient
+		socks5ClientAddr = oldClientAddr
+		socks5Mu.Unlock()
+	})
+
+	directClient := &http.Client{}
+	httpClient = directClient
+	socks5Mu.Lock()
+	socks5Proxies = []Socks5Proxy{{Addr: "127.0.0.1:1080", Name: "test"}}
+	activeSocks5 = "127.0.0.1:1080"
+	socks5PaidDirect = false
+	socks5Client = nil
+	socks5ClientAddr = ""
+	socks5Mu.Unlock()
+
+	paid := getHTTPClientForTier(TierPaid)
+	free := getHTTPClientForTier(TierFree)
+	if paid == directClient {
+		t.Fatal("default socks5_paid_direct=false should send paid traffic through SOCKS5")
+	}
+	if free == directClient {
+		t.Fatal("free traffic should use SOCKS5 when active_socks5 is set")
+	}
+	if paid != free {
+		t.Fatal("paid and free should share the cached SOCKS5 client when paid_direct is false")
+	}
+
+	socks5Mu.Lock()
+	socks5PaidDirect = true
+	socks5Client = nil
+	socks5ClientAddr = ""
+	socks5Mu.Unlock()
+	if getHTTPClientForTier(TierPaid) != directClient {
+		t.Fatal("socks5_paid_direct=true should keep paid traffic on the direct client")
+	}
+	if getHTTPClientForTier(TierFree) == directClient {
+		t.Fatal("free traffic should still use SOCKS5 when paid_direct is true")
+	}
+}
+
+func TestAdminConfigHandlerReturnsSocks5PaidDirect(t *testing.T) {
+	oldPaidDirect := socks5PaidDirect
+	t.Cleanup(func() {
+		socks5Mu.Lock()
+		socks5PaidDirect = oldPaidDirect
+		socks5Mu.Unlock()
+	})
+
+	socks5Mu.Lock()
+	socks5PaidDirect = true
+	socks5Mu.Unlock()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "/api/config", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	adminConfigHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var cfg AppConfig
+	if err := json.Unmarshal(rec.Body.Bytes(), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Socks5PaidDirect {
+		t.Fatalf("socks5_paid_direct = %t, want true", cfg.Socks5PaidDirect)
+	}
+}
+
+func TestBuildProxyClientPinsEgressConnection(t *testing.T) {
+	client := buildProxyClient(Socks5Proxy{Addr: "127.0.0.1:1080"})
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport type = %T, want *http.Transport", client.Transport)
+	}
+	if transport.MaxIdleConnsPerHost != 2 {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want 2", transport.MaxIdleConnsPerHost)
+	}
+	if transport.IdleConnTimeout != 30*time.Minute {
+		t.Fatalf("IdleConnTimeout = %s, want 30m", transport.IdleConnTimeout)
+	}
+}
+
+func TestResolveConfigPathPrecedence(t *testing.T) {
+	tmpDir := t.TempDir()
+	localConfig := filepath.Join(tmpDir, "config.json")
+	if err := os.WriteFile(localConfig, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+
+	userConfigRoot := filepath.Join(tmpDir, "user-config")
+	switch runtime.GOOS {
+	case "darwin":
+		t.Setenv("HOME", tmpDir)
+		userConfigRoot = filepath.Join(tmpDir, "Library", "Application Support")
+	case "windows":
+		t.Setenv("AppData", userConfigRoot)
+	default:
+		t.Setenv("XDG_CONFIG_HOME", userConfigRoot)
+	}
+	fallback := filepath.Join(userConfigRoot, "opencode2api", "config.json")
+
+	tests := []struct {
+		name      string
+		env       string
+		flagValue string
+		explicit  bool
+		want      string
+	}{
+		{
+			name:      "environment wins over explicit flag",
+			env:       "/tmp/env-config.json",
+			flagValue: "/tmp/flag-config.json",
+			explicit:  true,
+			want:      "/tmp/env-config.json",
+		},
+		{
+			name:      "explicit flag wins over local file",
+			flagValue: "/tmp/flag-config.json",
+			explicit:  true,
+			want:      "/tmp/flag-config.json",
+		},
+		{
+			name: "existing local file is backward compatible",
+			want: "config.json",
+		},
+		{
+			name:      "ignored flag value does not hide local file",
+			flagValue: "/tmp/ignored.json",
+			want:      "config.json",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.env == "" {
+				t.Setenv("OPENCODE2API_CONFIG", "")
+			} else {
+				t.Setenv("OPENCODE2API_CONFIG", tt.env)
+			}
+
+			if got := resolveConfigPath(tt.flagValue, tt.explicit); got != tt.want {
+				t.Fatalf("resolveConfigPath() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	if err := os.Remove(localConfig); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OPENCODE2API_CONFIG", "")
+	if got := resolveConfigPath("", false); got != fallback {
+		t.Fatalf("user fallback = %q, want %q", got, fallback)
+	}
+}
+
+func TestSaveConfigCreatesUserConfigDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode2api", "config.json")
+	if err := saveConfig(path, AppConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("saved config missing: %v", err)
+	}
+}
+
+func TestRunHTTPServerStopsOnContextCancellation(t *testing.T) {
+	var lc net.ListenConfig
+	listener, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runHTTPServer(ctx, server, time.Second, listener)
+	}()
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runHTTPServer() = %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server shutdown")
+	}
+	dialer := net.Dialer{Timeout: 100 * time.Millisecond}
+	if _, err := dialer.DialContext(context.Background(), "tcp", listener.Addr().String()); err == nil {
+		t.Fatal("listener is still accepting connections after shutdown")
+	}
+}
+
 type fakeUpstreamResponse struct {
-	status int
-	body   string
-	header http.Header
+	status  int
+	body    string
+	header  http.Header
+	bodyErr error
 }
 
 // fakeTransport 记录转发出去的原始请求和请求头，返回预设响应。
@@ -61,12 +314,61 @@ func (f *fakeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if header == nil {
 		header = make(http.Header)
 	}
+	body := io.NopCloser(strings.NewReader(next.body))
+	if next.bodyErr != nil {
+		body = &interruptedBody{data: next.body, err: next.bodyErr}
+	}
 	return &http.Response{
 		StatusCode: next.status,
 		Header:     header.Clone(),
-		Body:       io.NopCloser(strings.NewReader(next.body)),
+		Body:       body,
 		Request:    req,
 	}, nil
+}
+
+type interruptedBody struct {
+	data string
+	err  error
+	read bool
+}
+
+func (b *interruptedBody) Read(p []byte) (int, error) {
+	if !b.read {
+		b.read = true
+		return copy(p, b.data), nil
+	}
+	return 0, b.err
+}
+
+func (b *interruptedBody) Close() error { return nil }
+
+func TestChatCompletionsSSECopyErrorPreservesPassthrough(t *testing.T) {
+	installFakeOpenCodeClient(t, []fakeUpstreamResponse{{
+		status:  http.StatusOK,
+		body:    "data: {\"choices\":[]}\n\n",
+		header:  http.Header{"Content-Type": []string{"text/event-stream"}},
+		bodyErr: errors.New("secret io: read/write on closed pipe"),
+	}})
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer sk-validkey0123456789abcdef")
+	rec := httptest.NewRecorder()
+	chatCompletionsHandler(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "data: {\"choices\":[]}") {
+		t.Fatalf("original SSE chunk missing: %q", body)
+	}
+	wantBody := "data: {\"choices\":[]}\n\n"
+	if body != wantBody {
+		t.Fatalf("body = %q, want passthrough only %q", body, wantBody)
+	}
+	if strings.Contains(body, "secret io") || strings.Contains(body, "closed pipe") {
+		t.Fatalf("transport error leaked to client: %q", body)
+	}
 }
 
 func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *fakeTransport {

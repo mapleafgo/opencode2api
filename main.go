@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -13,9 +14,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -52,6 +56,11 @@ func socks5Dial(proxy Socks5Proxy) func(ctx context.Context, network, addr strin
 		conn, err := net.DialTimeout("tcp", proxy.Addr, 10*time.Second)
 		if err != nil {
 			return nil, fmt.Errorf("socks5 connect to %s: %w", proxy.Addr, err)
+		}
+		// 保持代理 TCP 连接活性，减少代理池回收空闲连接后更换出口 IP。
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.SetKeepAlive(true)
+			_ = tcp.SetKeepAlivePeriod(30 * time.Second)
 		}
 		deadline := time.Now().Add(15 * time.Second)
 		conn.SetDeadline(deadline)
@@ -186,14 +195,29 @@ func socks5Dial(proxy Socks5Proxy) func(ctx context.Context, network, addr strin
 }
 
 var (
-	socks5Proxies []Socks5Proxy
-	activeSocks5  string // 启用的代理 Addr，空表示直连，__round_robin__ 表示轮询
-	socks5Mu      sync.RWMutex
+	socks5Proxies    []Socks5Proxy
+	activeSocks5     string // 启用的代理 Addr，空表示直连，__round_robin__ 表示轮询
+	socks5PaidDirect bool   // true=带 key/付费直连；false/缺省=全部走代理
+	socks5Mu         sync.RWMutex
 )
 
 const socks5RR = "__round_robin__"
 
 var socks5RRIndex uint32
+
+// buildProxyClient 为指定 SOCKS5 代理创建客户端。空闲连接保持更长寿命，
+// 减少代理池回收空闲连接后更换出口 IP 的情况。
+func buildProxyClient(proxy Socks5Proxy) *http.Client {
+	return &http.Client{
+		Timeout: 300 * time.Second,
+		Transport: &http.Transport{
+			DialContext:         socks5Dial(proxy),
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 2,
+			IdleConnTimeout:     30 * time.Minute,
+		},
+	}
+}
 
 var (
 	socks5Client     *http.Client // 缓存的 SOCKS5 客户端
@@ -236,16 +260,7 @@ func getHTTPClient() *http.Client {
 		}
 	}
 
-	dial := socks5Dial(proxy)
-	client := &http.Client{
-		Timeout: 300 * time.Second,
-		Transport: &http.Transport{
-			DialContext:         dial,
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 20,
-			IdleConnTimeout:     90 * time.Second,
-		},
-	}
+	client := buildProxyClient(proxy)
 
 	if !useRR {
 		socks5Client = client
@@ -254,10 +269,17 @@ func getHTTPClient() *http.Client {
 	return client
 }
 
-// getHTTPClientForTier 根据层级返回 HTTP 客户端
-// 付费层走直连，免费层（默认）走 SOCKS5 代理（如配置）
+func getSocks5PaidDirect() bool {
+	socks5Mu.RLock()
+	defer socks5Mu.RUnlock()
+	return socks5PaidDirect
+}
+
+// getHTTPClientForTier 按认证层级选择 HTTP 客户端。
+// 默认（socks5_paid_direct 未填或 false）：只要配置了 active_socks5，付费/带 key 与 public 都走代理。
+// socks5_paid_direct=true 时恢复旧行为：付费层直连，仅免费层走代理。
 func getHTTPClientForTier(tier TierType) *http.Client {
-	if tier == TierPaid {
+	if tier == TierPaid && getSocks5PaidDirect() {
 		return httpClient
 	}
 	return getHTTPClient()
@@ -695,11 +717,33 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 type AppConfig struct {
-	Socks5Proxies []Socks5Proxy `json:"socks5_proxies,omitempty"`
-	ActiveSocks5  string        `json:"active_socks5,omitempty"`
+	Socks5Proxies    []Socks5Proxy `json:"socks5_proxies,omitempty"`
+	ActiveSocks5     string        `json:"active_socks5,omitempty"`
+	Socks5PaidDirect bool          `json:"socks5_paid_direct,omitempty"`
 }
 
 // ======================== 配置管理 ========================
+
+// resolveConfigPath 按环境变量、显式参数、当前目录旧文件和用户配置目录的顺序解析配置。
+// 返回值用于让服务模式在用户目录回退时自动创建配置目录。
+func resolveConfigPath(flagValue string, flagExplicit bool) string {
+	if envPath := strings.TrimSpace(os.Getenv("OPENCODE2API_CONFIG")); envPath != "" {
+		return envPath
+	}
+	flagValue = strings.TrimSpace(flagValue)
+	if flagExplicit && flagValue != "" {
+		return flagValue
+	}
+
+	const localPath = "config.json"
+	if _, err := os.Stat(localPath); err == nil {
+		return localPath
+	}
+	if userDir, err := os.UserConfigDir(); err == nil && strings.TrimSpace(userDir) != "" {
+		return filepath.Join(userDir, "opencode2api", localPath)
+	}
+	return localPath
+}
 
 func loadConfig(path string) AppConfig {
 	var cfg AppConfig
@@ -718,6 +762,11 @@ func saveConfig(path string, cfg AppConfig) error {
 	if err != nil {
 		return err
 	}
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create config directory %s: %w", dir, err)
+		}
+	}
 	return os.WriteFile(path, data, 0644)
 }
 
@@ -732,6 +781,7 @@ func applyConfig(cfg AppConfig) {
 		socks5ClientAddr = ""
 		atomic.StoreUint32(&socks5RRIndex, 0)
 	}
+	socks5PaidDirect = cfg.Socks5PaidDirect
 	socks5Mu.Unlock()
 
 }
@@ -923,7 +973,9 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", ct)
 	}
 	w.WriteHeader(upResp.StatusCode)
-	_, _ = io.Copy(w, upResp.Body)
+	if _, err := io.Copy(w, upResp.Body); err != nil {
+		slog.Error("upstream response copy failed", "request_id", reqID, "error", err)
+	}
 	slog.Debug("chat completion finished", "request_id", reqID, "status", upResp.StatusCode, "duration_ms", time.Since(start).Milliseconds())
 }
 
@@ -1031,6 +1083,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		socks5Mu.RLock()
 		cfg.Socks5Proxies = socks5Proxies
 		cfg.ActiveSocks5 = activeSocks5
+		cfg.Socks5PaidDirect = socks5PaidDirect
 		socks5Mu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(cfg)
@@ -1162,6 +1215,8 @@ header{display:flex;align-items:center;justify-content:space-between;margin-bott
 .form-group input,.m-select{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--mono);background:var(--surface-2);color:var(--text)}
 .form-group input:focus,.m-select:focus{outline:none;border-color:var(--accent)}
 .form-group .hint{font-size:11px;color:var(--text-ter);margin-top:4px}
+.check{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--text-sec);margin-top:12px}
+.check input{width:auto;margin:0}
 .actions{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
 .btn{padding:8px 16px;border-radius:var(--radius-sm);font-size:12.5px;font-weight:500;cursor:pointer;border:none;font-family:var(--font);white-space:nowrap}
 .btn-primary{background:var(--accent-dim);color:var(--accent)}
@@ -1217,6 +1272,7 @@ header{display:flex;align-items:center;justify-content:space-between;margin-bott
 <option value="">直连（不使用代理）</option>
 </select>
 </div>
+<label class="check"><input type="checkbox" id="socks5_paid_direct"> 带 key / 付费请求直连</label>
 <div class="actions">
 <button class="btn btn-primary" onclick="addSocks5Row()">添加代理</button>
 <button class="btn btn-success" onclick="saveConfig()">保存全部</button>
@@ -1229,13 +1285,13 @@ header{display:flex;align-items:center;justify-content:space-between;margin-bott
 let socks5Data=[];
 function toggleTheme(){const d=document.documentElement;const n=d.getAttribute('data-theme')==='dark'?'light':'dark';if(n==='dark')d.setAttribute('data-theme','dark');else d.removeAttribute('data-theme');localStorage.setItem('theme',n);document.querySelector('.theme-toggle').textContent=n==='dark'?'🌙':'☀'}
 (function(){const t=localStorage.getItem('theme');if(t==='dark')document.documentElement.setAttribute('data-theme','dark')})();
-async function loadConfig(){const r=await fetch('/api/config');const cfg=await r.json();socks5Data=cfg.socks5_proxies||[];renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||''}
+async function loadConfig(){const r=await fetch('/api/config');const cfg=await r.json();socks5Data=cfg.socks5_proxies||[];renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||'';document.getElementById('socks5_paid_direct').checked=!!cfg.socks5_paid_direct}
 function renderSocks5Table(){const tb=document.querySelector('#socks5Table tbody');if(!socks5Data.length){tb.innerHTML='<tr><td colspan="5" class="empty-hint">暂无代理配置</td></tr>';renderSocks5Select();return}tb.innerHTML=socks5Data.map((p,i)=>'<tr><td><input value="'+esc(p.name||'')+'" data-field="name"></td><td><input value="'+esc(p.addr)+'" data-field="addr" placeholder="127.0.0.1:1080"></td><td><input value="'+esc(p.username||'')+'" data-field="username"></td><td><input value="'+esc(p.password||'')+'" data-field="password" type="password"></td><td><button class="btn btn-danger" onclick="delSocks5('+i+')">删除</button></td></tr>').join('');renderSocks5Select()}
 function addSocks5Row(){const tb=document.querySelector('#socks5Table tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';socks5Data.push({addr:'',name:''});renderSocks5Table()}
 function delSocks5(i){socks5Data.splice(i,1);renderSocks5Table()}
 function collectSocks5(){const r=[];document.querySelectorAll('#socks5Table tbody tr').forEach(tr=>{const a=tr.querySelector('[data-field="addr"]');if(a&&a.value.trim())r.push({addr:a.value.trim(),name:(tr.querySelector('[data-field="name"]')||{}).value?.trim()||'',username:(tr.querySelector('[data-field="username"]')||{}).value?.trim()||'',password:(tr.querySelector('[data-field="password"]')||{}).value?.trim()||''})});socks5Data=r;return r}
 function renderSocks5Select(){const sel=document.getElementById('activeSocks5');const cur=sel.value;sel.innerHTML='<option value="">直连（不使用代理）</option>';socks5Data.forEach(p=>{if(p.addr){const label=p.name?p.name+' ('+p.addr+')':p.addr;const opt=document.createElement('option');opt.value=p.addr;opt.textContent=label;sel.appendChild(opt)}});if(socks5Data.length>=2){const opt=document.createElement('option');opt.value='__round_robin__';opt.textContent='轮询（自动切换）';sel.appendChild(opt)}sel.value=cur;if(!sel.value)sel.value=''}
-async function saveConfig(){collectSocks5();const cfg={socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
+async function saveConfig(){collectSocks5();const cfg={socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value,socks5_paid_direct:document.getElementById('socks5_paid_direct').checked};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
 async function reloadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/reload',{method:'POST'});if(!r.ok)throw new Error(await r.text());const d=await r.json();showToast('会话已刷新，Go 模型 '+d.go+' 个','success')}catch(e){showToast('刷新失败: '+e.message,'error')}setTimeout(()=>window.scrollTo(0,sy),100)}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function showToast(msg,t){const e=document.getElementById('toast');e.textContent=msg;e.className=t+' show';clearTimeout(e._tid);e._tid=setTimeout(()=>e.classList.remove('show'),2500)}
@@ -1257,6 +1313,7 @@ func main() {
 	flag.BoolVar(&showVersion, "version", false, "显示版本信息")
 	flag.Parse()
 
+	configPath = resolveConfigPath(configPath, flagSet("config"))
 	initLogger()
 
 	if showVersion {
@@ -1305,10 +1362,59 @@ func main() {
 	}
 	registerRoutes(http.DefaultServeMux)
 	addr := ":" + port
-	slog.Info("listening", "addr", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		slog.Error("server terminated", "error", err)
+	listener, err := listenTCP(addr)
+	if err != nil {
+		slog.Error("server listen failed", "addr", addr, "error", err)
 		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	slog.Info("listening", "addr", addr)
+	server := &http.Server{Handler: http.DefaultServeMux}
+	runErr := runHTTPServer(ctx, server, 10*time.Second, listener)
+	stop()
+	if runErr != nil {
+		slog.Error("server terminated", "error", runErr)
+		os.Exit(1)
+	}
+}
+
+// listenTCP 使用可取消的 ListenConfig 创建服务监听器。
+func listenTCP(addr string) (net.Listener, error) {
+	var lc net.ListenConfig
+	return lc.Listen(context.Background(), "tcp", addr)
+}
+
+// flagSet 返回标准库 flag 是否在命令行中显式出现，包含 -config=value 形式。
+func flagSet(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
+// runHTTPServer 运行 HTTP 服务，并在父上下文结束时等待活跃请求退出。
+// 调用方先显式 Listen，可以让绑定错误在进入 goroutine 前直接返回。
+func runHTTPServer(ctx context.Context, srv *http.Server, shutdownTimeout time.Duration, ln net.Listener) error {
+	errCh := make(chan error, 1)
+	go func() {
+		err := srv.Serve(ln)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
+		defer cancel()
+		return srv.Shutdown(shutdownCtx)
 	}
 }
 
