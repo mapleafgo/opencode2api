@@ -310,9 +310,10 @@ func TestListModelsHandlerSeparatesPublicZenAndGoCatalogs(t *testing.T) {
 	oldModelsLoaded := modelsLoaded
 	modelMu.Lock()
 	modelsCache = []ModelInfo{
-		{ID: "deepseek-v4-flash-free"},
-		{ID: "glm-5.2"},
-		{ID: "gpt-5.5"},
+		{ID: "big-pickle"},
+		{ID: "deepseek-v4-flash-free", Deprecated: true},
+		{ID: "glm-5.2", PositiveInputCost: true},
+		{ID: "gpt-5.5", PositiveInputCost: true},
 	}
 	goModelsCache = []ModelInfo{
 		{ID: "glm-5.2"},
@@ -335,17 +336,17 @@ func TestListModelsHandlerSeparatesPublicZenAndGoCatalogs(t *testing.T) {
 	}{
 		{
 			name:    "public only sees free zen models",
-			wantIDs: []string{"deepseek-v4-flash-free"},
+			wantIDs: []string{"big-pickle"},
 		},
 		{
 			name:       "bare zen key sees zen catalog only",
 			authHeader: "Bearer sk-auto0123456789abcdef",
-			wantIDs:    []string{"deepseek-v4-flash-free", "glm-5.2", "gpt-5.5"},
+			wantIDs:    []string{"big-pickle", "deepseek-v4-flash-free", "glm-5.2", "gpt-5.5"},
 		},
 		{
 			name:       "go prefix sees free and go catalog",
 			authHeader: "Bearer go:sk-go0123456789abcdef",
-			wantIDs:    []string{"deepseek-v4-flash-free", "glm-5.2", "kimi-k2.7-code"},
+			wantIDs:    []string{"big-pickle", "glm-5.2", "kimi-k2.7-code"},
 		},
 	}
 
@@ -374,6 +375,38 @@ func TestListModelsHandlerSeparatesPublicZenAndGoCatalogs(t *testing.T) {
 			}
 			if !reflect.DeepEqual(gotIDs, tt.wantIDs) {
 				t.Fatalf("listModelsHandler() ids = %#v, want %#v", gotIDs, tt.wantIDs)
+			}
+		})
+	}
+}
+
+func TestIsFreeModelFollowsOpenCodeCatalogRule(t *testing.T) {
+	tests := []struct {
+		name  string
+		model ModelInfo
+		want  bool
+	}{
+		{
+			name:  "zero input cost without suffix is free",
+			model: ModelInfo{ID: "big-pickle"},
+			want:  true,
+		},
+		{
+			name:  "positive input cost with free suffix is paid",
+			model: ModelInfo{ID: "future-model-free", PositiveInputCost: true},
+			want:  false,
+		},
+		{
+			name:  "deprecated free model is disabled",
+			model: ModelInfo{ID: "deepseek-v4-flash-free", Deprecated: true},
+			want:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isFreeModel(tt.model); got != tt.want {
+				t.Fatalf("isFreeModel(%q) = %v, want %v", tt.model.ID, got, tt.want)
 			}
 		})
 	}

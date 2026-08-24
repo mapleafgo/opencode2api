@@ -336,10 +336,12 @@ func refreshOCSession() {
 // ======================== 模型 ========================
 
 type ModelInfo struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
+	ID                string `json:"id"`
+	Object            string `json:"object"`
+	Created           int64  `json:"created"`
+	OwnedBy           string `json:"owned_by"`
+	PositiveInputCost bool   `json:"-"`
+	Deprecated        bool   `json:"-"`
 }
 
 var (
@@ -349,8 +351,78 @@ var (
 	modelsLoaded  bool
 )
 
-func fetchModels() ([]ModelInfo, error) {
-	req, _ := http.NewRequest("GET", "https://opencode.ai/zen/v1/models", nil)
+type openCodeCatalogModel struct {
+	Status string          `json:"status"`
+	Cost   json.RawMessage `json:"cost"`
+}
+
+func hasPositiveInputCost(cost json.RawMessage) bool {
+	var tiers []struct {
+		Input float64 `json:"input"`
+	}
+	if err := json.Unmarshal(cost, &tiers); err == nil {
+		for _, tier := range tiers {
+			if tier.Input > 0 {
+				return true
+			}
+		}
+		return false
+	}
+
+	var tier struct {
+		Input float64 `json:"input"`
+	}
+	if err := json.Unmarshal(cost, &tier); err != nil {
+		return false
+	}
+	return tier.Input > 0
+}
+
+func fetchOpenCodeCatalog(ctx context.Context) (map[string]openCodeCatalogModel, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://models.opencode.ai/api.json", nil)
+	req.Header.Set("User-Agent", fmt.Sprintf("opencode/%s", ocClientVer))
+	resp, err := getHTTPClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("opencode catalog returned %d", resp.StatusCode)
+	}
+
+	var result struct {
+		OpenCode struct {
+			Models map[string]openCodeCatalogModel `json:"models"`
+		} `json:"opencode"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	return result.OpenCode.Models, nil
+}
+
+// 按 OpenCode 官方目录补齐免费判定所需的成本与状态元数据。
+func annotateOpenCodeModels(ctx context.Context, models []ModelInfo) error {
+	catalog, err := fetchOpenCodeCatalog(ctx)
+	if err != nil {
+		return err
+	}
+	for i := range models {
+		model := &models[i]
+		item, ok := catalog[model.ID]
+		if !ok {
+			model.PositiveInputCost = true
+			continue
+		}
+		model.Deprecated = item.Status == "deprecated"
+		model.PositiveInputCost = hasPositiveInputCost(item.Cost)
+	}
+	return nil
+}
+
+func fetchModels(ctx context.Context) ([]ModelInfo, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://opencode.ai/zen/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer public")
 	req.Header.Set("x-opencode-session", ocSessionID)
 	resp, err := getHTTPClient().Do(req)
@@ -371,6 +443,9 @@ func fetchModels() ([]ModelInfo, error) {
 	now := time.Now().Unix()
 	for _, m := range result.Data {
 		models = append(models, ModelInfo{ID: m.ID, Object: "model", Created: now, OwnedBy: "opencode"})
+	}
+	if err := annotateOpenCodeModels(ctx, models); err != nil {
+		return nil, err
 	}
 	return models, nil
 }
@@ -428,7 +503,7 @@ func startModelRefresh() {
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
-			fetched, err := fetchModels()
+			fetched, err := fetchModels(context.Background())
 			if err == nil && len(fetched) > 0 {
 				modelMu.Lock()
 				modelsCache = fetched
@@ -741,9 +816,9 @@ func (auth UpstreamAuth) shouldUseGoEndpoint(modelID string) bool {
 	}
 }
 
-// isFreeModel 判断模型是否属于免费模型（以 -free 结尾）
-func isFreeModel(modelID string) bool {
-	return strings.HasSuffix(modelID, "-free")
+// isFreeModel 与 OpenCode 无凭据规则一致：deprecated 禁用，任一价格档 input > 0 视为付费。
+func isFreeModel(model ModelInfo) bool {
+	return !model.Deprecated && !model.PositiveInputCost
 }
 
 // forwardUpstream 把客户端请求体原样转发到指定目录的上游接口，
@@ -863,7 +938,7 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 	loaded, models := modelsLoaded, modelsCache
 	modelMu.RUnlock()
 	if !loaded || len(models) == 0 {
-		fetched, err := fetchModels()
+		fetched, err := fetchModels(r.Context())
 		if err == nil && len(fetched) > 0 {
 			modelMu.Lock()
 			modelsCache = fetched
@@ -887,7 +962,7 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 		modelMu.RLock()
 		combinedModels = make([]ModelInfo, 0, len(models)+len(goModelsCache))
 		for _, model := range models {
-			if isFreeModel(model.ID) {
+			if isFreeModel(model) {
 				combinedModels = append(combinedModels, model)
 			}
 		}
@@ -903,7 +978,7 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 	if auth.Mode == AuthRoutePublic {
 		filtered := make([]ModelInfo, 0, len(combinedModels))
 		for _, m := range combinedModels {
-			if isFreeModel(m.ID) {
+			if isFreeModel(m) {
 				filtered = append(filtered, m)
 			}
 		}
@@ -925,7 +1000,7 @@ func reloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	refreshOCSession()
-	fetched, err := fetchModels()
+	fetched, err := fetchModels(r.Context())
 	if err == nil && len(fetched) > 0 {
 		modelMu.Lock()
 		modelsCache = fetched
@@ -1197,7 +1272,7 @@ func main() {
 
 	slog.Info("config loaded", "path", configPath)
 	initOCSession()
-	models, err := fetchModels()
+	models, err := fetchModels(context.Background())
 	if err != nil {
 		slog.Warn("failed to fetch models on startup", "error", err)
 	} else {
